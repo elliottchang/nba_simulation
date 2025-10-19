@@ -13,17 +13,46 @@ TODO:
 # IMPORTS
 # ====================================================================
 
-from nba_api.stats.endpoints import commonteamroster, playergamelog
+from nba_api.stats.endpoints import commonteamroster, playergamelog, leaguegamefinder
 from nba_api.stats.static import teams, players
 from player_aware_predictor import PlayerAwarePredictor
 from train_possession_model import FeatureEngineer  # Needed for unpickling
 import numpy as np
 import pandas as pd
+import random
+import time
+from typing import Dict, List, Tuple
 
 
 # ====================================================================
 # HELPER FUNCTIONS
 # ====================================================================
+
+def retry_api_call(func, max_retries: int = 3, base_delay: float = 2.0, timeout: int = 60):
+    """
+    Retry an API call with exponential backoff.
+    
+    Args:
+        func: Function to call (should be a lambda or callable with no args)
+        max_retries: Maximum number of retry attempts
+        base_delay: Base delay in seconds (will be doubled for each retry)
+        timeout: Timeout for the API call in seconds
+    
+    Returns:
+        Result of the function call, or None if all retries failed
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise  # Re-raise on final attempt
+            
+            delay = base_delay * (2 ** attempt)
+            print(f"  API retry {attempt + 1}/{max_retries}: {str(e)[:100]}...")
+            time.sleep(delay)
+    
+    return None
 
 # Load dataframe of NBA teams
 nba_teams = pd.DataFrame(teams.get_teams())
@@ -138,9 +167,22 @@ class Team:
         self.location = str(team_info['location'])
         self.season = str(season)
         
-        # Get roster from NBA API
-        endpoint = commonteamroster.CommonTeamRoster(team_id=self.team_id, season=self.season)
-        self.roster_df = endpoint.get_data_frames()[0]
+        # Get roster from NBA API with retry logic
+        try:
+            self.roster_df = retry_api_call(
+                lambda: commonteamroster.CommonTeamRoster(team_id=self.team_id, season=self.season).get_data_frames()[0],
+                max_retries=3,
+                base_delay=2.0
+            )
+        except Exception as e:
+            print(f"⚠️  Failed to get roster for team {self.team_id} after retries: {e}")
+            # Create a minimal roster to prevent crashes
+            self.roster_df = pd.DataFrame({
+                'PLAYER_ID': [999999 + i for i in range(5)],
+                'PLAYER': [f'Player_{i+1}' for i in range(5)],
+                'POSITION': ['G', 'G', 'F', 'F', 'C'],
+                'NUM': [i+1 for i in range(5)]
+            })
         
         # Game state (updated during game)
         self.starters = self.pick_starters(self.roster_df, season)
@@ -163,16 +205,28 @@ class Team:
                 p = Player(player_id=int(pid), season=season)
                 df = p.gamelog
                 if df.empty:
+                    # Add player with default stats if no gamelog
+                    records.append((int(pid), 0, 0.0))
                     continue
                 starts = int(df.get("GS", pd.Series([0] * len(df))).fillna(0).astype(int).sum())
                 avg_min = float(pd.Series(df.get("MIN", [])).apply(_mins_to_float).mean()) if "MIN" in df.columns else 0.0
                 records.append((int(pid), starts, avg_min))
             except Exception:
-                pass  # Skip players with no logs
+                # Add player with default stats if API fails
+                records.append((int(pid), 0, 0.0))
         
         # Sort by games started, then average minutes
         records.sort(key=lambda x: (x[1], x[2]), reverse=True)
-        return [pid for pid, _, _ in records[:5]]
+        
+        # Ensure we return exactly 5 starters, pad with available players if needed
+        selected_starters = [pid for pid, _, _ in records[:5]]
+        
+        # If we don't have 5 players, fill with remaining roster players
+        if len(selected_starters) < 5:
+            available_pids = [pid for pid in roster_df["PLAYER_ID"].tolist() if pid not in selected_starters]
+            selected_starters.extend(available_pids[:5 - len(selected_starters)])
+        
+        return selected_starters[:5]  # Ensure we return exactly 5
     
     def __str__(self) -> str:
         header = f"{self.season} {self.location} {self.team_name} Summary:"
@@ -188,15 +242,30 @@ class Player:
     """
     
     def __init__(self, player_id: int, season: str):
-        player_info = players.find_player_by_id(player_id)
+        try:
+            player_info = players.find_player_by_id(player_id)
+            self.name = player_info['full_name']
+        except Exception:
+            self.name = f"Player_{player_id}"
         
         self.id = player_id
-        self.name = player_info['full_name']
-        self.gamelog = playergamelog.PlayerGameLog(
-            player_id=player_id,
-            season=season,
-            season_type_all_star='Regular Season'
-        ).get_data_frames()[0]
+        
+        # Get player gamelog with retry logic
+        try:
+            self.gamelog = retry_api_call(
+                lambda: playergamelog.PlayerGameLog(
+                    player_id=player_id,
+                    season=season,
+                    season_type_all_star='Regular Season'
+                ).get_data_frames()[0],
+                max_retries=2,  # Fewer retries for individual players
+                base_delay=1.0
+            )
+            if self.gamelog is None:
+                self.gamelog = pd.DataFrame()  # Empty dataframe if API fails
+        except Exception as e:
+            # If all retries fail, create empty gamelog to prevent crashes
+            self.gamelog = pd.DataFrame()
 
 
 class GameEngine:
@@ -604,6 +673,10 @@ class GameEngine:
             return 0.68  # ~68% defensive rebound rate
         return 0.70  # Default
     
+    def select_rebounder(self, team_lineup: list, team_roster_df: pd.DataFrame) -> int:
+        """Select a random player from the lineup to get the rebound."""
+        return np.random.choice(team_lineup)
+    
     def step_possession(self) -> dict:
         """
         Simulate ONE offensive outcome (e.g., one shot attempt, one turnover).
@@ -655,6 +728,7 @@ class GameEngine:
         ftm = 0
         to = 0
         pf = 0
+        description = ""  # Initialize description variable
         
         # Process outcome and update stats
         if outcome == '2pt_make':
@@ -732,23 +806,44 @@ class GameEngine:
             # Defensive foul (non-shooting) - possession continues
             description = f"Defensive foul on {defensive_team.team_abbr}"
         
+        else:
+            # Fallback for unexpected outcomes
+            description = f"{player_name} {outcome}"
+        
         # Determine if possession ends
         poss_end_type = self.outcome_ends_possession(outcome)
         
         if poss_end_type == 'yes':
             possession_ends = True
+            rebound_info = None
         elif poss_end_type == 'miss':
             # Check for defensive rebound
             def_reb_prob = self.get_defensive_rebound_probability(outcome)
             is_def_rebound = np.random.random() < def_reb_prob
             possession_ends = is_def_rebound
             
+            # Select rebounder and create rebound info
             if is_def_rebound:
-                description += " → Defensive rebound"
+                rebounder_id = self.select_rebounder(defensive_team.lineup, defensive_team.roster_df)
+                rebounder_name = defensive_team.roster_df[defensive_team.roster_df['PLAYER_ID'] == rebounder_id]['PLAYER'].values[0]
+                description += f" → Defensive rebound by {rebounder_name}"
+                rebound_info = {
+                    'rebounder_id': rebounder_id,
+                    'rebounder_team': defensive_team,
+                    'is_offensive': False
+                }
             else:
-                description += " → OFFENSIVE REBOUND!"
+                rebounder_id = self.select_rebounder(offensive_team.lineup, offensive_team.roster_df)
+                rebounder_name = offensive_team.roster_df[offensive_team.roster_df['PLAYER_ID'] == rebounder_id]['PLAYER'].values[0]
+                description += f" → OFFENSIVE REBOUND by {rebounder_name}!"
+                rebound_info = {
+                    'rebounder_id': rebounder_id,
+                    'rebounder_team': offensive_team,
+                    'is_offensive': True
+                }
         else:
             possession_ends = False
+            rebound_info = None
         
         return {
             'outcome': outcome,
@@ -757,6 +852,7 @@ class GameEngine:
             'points': points,
             'possession_ends': possession_ends,
             'description': description,
+            'rebound_info': rebound_info,
             'stats': {
                 'fga': fga,
                 'fgm': fgm,
@@ -775,16 +871,27 @@ class GameEngine:
         stats = result['stats']
         
         # Update offensive player stats
-        offensive_team.boxscore.loc[player_id, 'PTS'] += result['points']
-        offensive_team.boxscore.loc[player_id, 'FGA'] += stats['fga']
-        offensive_team.boxscore.loc[player_id, 'FGM'] += stats['fgm']
-        offensive_team.boxscore.loc[player_id, '3PA'] += stats['3pa']
-        offensive_team.boxscore.loc[player_id, '3PM'] += stats['3pm']
-        offensive_team.boxscore.loc[player_id, 'FTA'] += stats['fta']
-        offensive_team.boxscore.loc[player_id, 'FTM'] += stats['ftm']
-        offensive_team.boxscore.loc[player_id, 'TO'] += stats['to']
-        offensive_team.boxscore.loc[player_id, 'PF'] += stats['pf']
-    
+        if player_id in offensive_team.boxscore.index:
+            offensive_team.boxscore.loc[player_id, 'PTS'] += result['points']
+            offensive_team.boxscore.loc[player_id, 'FGA'] += stats['fga']
+            offensive_team.boxscore.loc[player_id, 'FGM'] += stats['fgm']
+            offensive_team.boxscore.loc[player_id, '3PA'] += stats['3pa']
+            offensive_team.boxscore.loc[player_id, '3PM'] += stats['3pm']
+            offensive_team.boxscore.loc[player_id, 'FTA'] += stats['fta']
+            offensive_team.boxscore.loc[player_id, 'FTM'] += stats['ftm']
+            offensive_team.boxscore.loc[player_id, 'TO'] += stats['to']
+            offensive_team.boxscore.loc[player_id, 'PF'] += stats['pf']
+        
+        # Update rebound stats if rebound occurred
+        if result.get('rebound_info'):
+            rebound_info = result['rebound_info']
+            rebounder_id = rebound_info['rebounder_id']
+            rebounder_team = rebound_info['rebounder_team']
+            
+            if rebounder_id in rebounder_team.boxscore.index:
+                rebounder_team.boxscore.loc[rebounder_id, 'REB'] += 1
+
+        offensive_team.boxscore = offensive_team.boxscore.sort_values(by='PTS', ascending=False)
 
     def step(self):
         """
@@ -830,9 +937,11 @@ class GameEngine:
         
         # Update plus/minus for all players on court (for the full possession)
         for pid in offensive_team.lineup:
-            offensive_team.boxscore.loc[pid, '+/-'] += total_possession_points
+            if pid in offensive_team.boxscore.index:
+                offensive_team.boxscore.loc[pid, '+/-'] += total_possession_points
         for pid in defensive_team.lineup:
-            defensive_team.boxscore.loc[pid, '+/-'] -= total_possession_points
+            if pid in defensive_team.boxscore.index:
+                defensive_team.boxscore.loc[pid, '+/-'] -= total_possession_points
         
         # Calculate possession time and update clock/minutes
         # Base time + extra time for offensive rebounds/fouls
@@ -843,6 +952,46 @@ class GameEngine:
         possession_time_minutes = total_time_seconds / 60.0
         
         self.quarter_duration -= total_time_seconds
+        
+        
+        # Check if quarter/period has ended
+        if self.quarter_duration <= 0:
+            if self.quarter <= 4:
+                print(f"\n🎯 END OF QUARTER {self.quarter}")
+                print(f"Score: {self.hometeam.team_abbr} {self.hometeam.score} vs {self.awayteam.team_abbr} {self.awayteam.score}")
+                self.quarter += 1
+                if self.quarter <= 4:
+                    self.quarter_duration = 12 * 60  # Reset to 12 minutes for next quarter
+                    print(f"Starting Quarter {self.quarter}")
+                else:
+                    # Regular time is over - check for overtime
+                    if self.hometeam.score == self.awayteam.score:
+                        print("⏰ END OF REGULATION - TIE GAME!")
+                        print("🏀 OVERTIME NEEDED!")
+                        self.quarter = 5  # First overtime
+                        self.quarter_duration = self.ot_duration  # 5 minutes
+                        print(f"Starting Overtime {self.quarter - 4}")
+                    else:
+                        winner = self.hometeam.team_abbr if self.hometeam.score > self.awayteam.score else self.awayteam.team_abbr
+                        print(f"🏆 GAME OVER! {winner} wins!")
+            else:
+                # This is an overtime period (quarter 5+)
+                ot_num = self.quarter - 4
+                print(f"\n⏰ END OF OVERTIME {ot_num}")
+                print(f"Score: {self.hometeam.team_abbr} {self.hometeam.score} vs {self.awayteam.team_abbr} {self.awayteam.score}")
+                
+                if self.hometeam.score == self.awayteam.score:
+                    # Still tied - another overtime needed
+                    self.quarter += 1
+                    ot_num = self.quarter - 4
+                    self.quarter_duration = self.ot_duration  # 5 minutes
+                    print(f"🏀 Another Overtime needed! Starting Overtime {ot_num}")
+                else:
+                    # Overtime winner found
+                    winner = self.hometeam.team_abbr if self.hometeam.score > self.awayteam.score else self.awayteam.team_abbr
+                    print(f"🏆 OVERTIME WINNER: {winner}!")
+                    print("🏆 GAME OVER!")
+                    self.quarter = 999  # Mark game as completely finished
         
         # Update minutes for all players on court
         for player_id in offensive_team.lineup + defensive_team.lineup:
@@ -890,32 +1039,581 @@ class GameEngine:
     # ================================================================
     
     def simulate_game(self) -> None:
-        """Simulate a complete 4-quarter game."""
-        while self.quarter <= 4:
+        """Simulate a complete game with possible overtime."""
+        while self.quarter < 10 and self.quarter != 999:  # Allow up to 10 periods (4 quarters + 6 overtimes)
             self.step()
-            if self.quarter_duration <= 0:
-                self.quarter += 1
-                self.quarter_duration = 12 * 60
+            # Quarter advancement is handled in step() method now
     
     def get_boxscore_display(self, team: str) -> pd.DataFrame:
         """
-        Get boxscore with minutes rounded for display.
+        Get boxscore with minutes rounded and shooting percentages added.
         
         Args:
             team: 'home' or 'away'
         
         Returns:
-            DataFrame with integer minutes (original unchanged)
+            DataFrame with integer minutes and calculated percentages
         """
         boxscore = self.hometeam.boxscore if team == 'home' else self.awayteam.boxscore
         display_box = boxscore.copy()
+        
+        # Round minutes to integers for display
         display_box['MIN'] = display_box['MIN'].round(0).astype(int)
-        return display_box
+        
+        # Calculate shooting percentages
+        # FG% = FGM / FGA (avoid division by zero)
+        display_box['FG%'] = display_box.apply(lambda row: 
+            f"{(row['FGM'] / row['FGA'] * 100):.1f}%" if row['FGA'] > 0 else "0.0%", axis=1)
+        
+        # 3P% = 3PM / 3PA
+        display_box['3P%'] = display_box.apply(lambda row: 
+            f"{(row['3PM'] / row['3PA'] * 100):.1f}%" if row['3PA'] > 0 else "0.0%", axis=1)
+        
+        # FT% = FTM / FTA
+        display_box['FT%'] = display_box.apply(lambda row: 
+            f"{(row['FTM'] / row['FTA'] * 100):.1f}%" if row['FTA'] > 0 else "0.0%", axis=1)
+        
+        # Reorder columns to put percentages after their respective attempt columns
+        cols = list(display_box.columns)
+        
+        # Remove percentage columns first if they exist to avoid duplicates
+        for pct_col in ['FG%', '3P%', 'FT%']:
+            if pct_col in cols:
+                cols.remove(pct_col)
+        
+        # Insert percentages after their respective attempt columns
+        if 'FGA' in cols:
+            fga_idx = cols.index('FGA') + 1
+            cols.insert(fga_idx, 'FG%')
+        
+        if '3PA' in cols:
+            threep_idx = cols.index('3PA') + 1
+            # Adjust index if FG% was added before 3PA
+            if 'FG%' in cols and cols.index('FG%') < threep_idx:
+                threep_idx += 1
+            cols.insert(threep_idx, '3P%')
+        
+        if 'FTA' in cols:
+            fta_idx = cols.index('FTA') + 1
+            # Adjust index if FG% or 3P% were added before FTA
+            adjustments = sum(1 for pct in ['FG%', '3P%'] if pct in cols and cols.index(pct) < fta_idx)
+            fta_idx += adjustments
+            cols.insert(fta_idx, 'FT%')
+        
+        return display_box[cols]
     
     def restart_game(self):
         """Restart game with same teams."""
         self.__init__(self.hometeam.team_id, self.awayteam.team_id, self.season)
     
     def __str__(self) -> str:
-        return f"Q{self.quarter} - {self.hometeam.team_abbr} {self.hometeam.score} vs {self.awayteam.team_abbr} {self.awayteam.score}"
+        if self.quarter <= 4:
+            period = f"Q{self.quarter}"
+        else:
+            ot_num = self.quarter - 4
+            period = f"OT{ot_num}"
+        return f"{period} - {self.hometeam.team_abbr} {self.hometeam.score} vs {self.awayteam.team_abbr} {self.awayteam.score}"
 
+
+class Season:
+    """
+    NBA Season Simulation System.
+    Simulates complete seasons with standings, player/team stats, and schedules.
+    """
+    
+    def __init__(self, season: str, max_games_per_team: int = 82):
+        """
+        Initialize season simulation.
+        
+        Args:
+            season: NBA season string (e.g., '2023-24')
+            max_games_per_team: Maximum regular season games (default 82)
+        """
+        self.season = season
+        self.max_games_per_team = max_games_per_team
+        
+        # Initialize predictor once for efficiency
+        self.predictor = PlayerAwarePredictor()
+        
+        # Get all NBA teams
+        self.teams_df = nba_teams
+        self.team_ids = self.teams_df['id'].tolist()
+        self.num_teams = len(self.team_ids)
+        
+        # Initialize tracking structures
+        self.team_records = {}  # team_id -> {'W': wins, 'L': losses, 'PF': points_for, 'PA': points_against}
+        self.team_stats = {}    # team_id -> aggregated stats
+        self.player_season_stats = {}  # player_id -> season totals
+        self.schedule = {}      # team_id -> list of game tuples (opponent_id, home/away, result)
+        self.completed_games = []  # List of completed game results
+        
+        # Initialize team records and stats
+        for team_id in self.team_ids:
+            self.team_records[team_id] = {'W': 0, 'L': 0, 'PF': 0, 'PA': 0}
+            self.team_stats[team_id] = self._init_team_stats()
+            self.schedule[team_id] = []
+        
+        print(f"🏀 Initialized {self.season} season simulation")
+        print(f"   Teams: {self.num_teams}")
+        print(f"   Max games per team: {self.max_games_per_team}")
+    
+    def _init_team_stats(self) -> Dict:
+        """Initialize empty team stats."""
+        return {
+            'games_played': 0,
+            'total_minutes': 0.0,
+            'total_points': 0,
+            'total_rebounds': 0,
+            'total_assists': 0,
+            'total_fgm': 0,
+            'total_fga': 0,
+            'total_3pm': 0,
+            'total_3pa': 0,
+            'total_ftm': 0,
+            'total_fta': 0,
+            'total_turnovers': 0,
+            'total_fouls': 0
+        }
+    
+    def generate_schedule(self):
+        """Generate a simplified NBA schedule."""
+        print("📅 Generating schedule...")
+        
+        # Create a round-robin schedule with some modifications
+        for team_id in self.team_ids:
+            opponents = [tid for tid in self.team_ids if tid != team_id]
+            random.shuffle(opponents)
+            
+            games_needed = self.max_games_per_team
+            games_added = 0
+            
+            # Add games against each opponent multiple times to reach 82 games
+            while games_added < games_needed:
+                for opponent_id in opponents:
+                    if games_added >= games_needed:
+                        break
+                    
+                    # Randomly assign home/away
+                    is_home = random.choice([True, False])
+                    
+                    self.schedule[team_id].append({
+                        'opponent_id': opponent_id,
+                        'is_home': is_home,
+                        'result': None,  # Will be filled after game simulation
+                        'game_id': f"{team_id}_{opponent_id}_{games_added}"
+                    })
+                    games_added += 1
+                    
+                    # Stop if we've added enough games
+                    if games_added >= games_needed:
+                        break
+                        
+                # Reshuffle opponents for variety
+                random.shuffle(opponents)
+        
+        total_games = sum(len(schedule) for schedule in self.schedule.values())
+        print(f"   Generated {total_games // 2} total games (since each game appears in both teams' schedules)")
+    
+    def simulate_game(self, home_team_id: int, away_team_id: int) -> Dict:
+        """
+        Simulate a single game between two teams.
+        
+        Returns:
+            Dict with game result including scores, player stats, etc.
+        """
+        try:
+            # Add small delay to prevent API overload
+            time.sleep(0.5)
+            
+            # Create game engine
+            game = GameEngine(home_team_id, away_team_id, self.season, self.predictor)
+            
+            # Simulate the full game
+            while game.quarter < 10 and game.quarter != 999:  # Allow overtime
+                game.step()
+            
+            # Extract results
+            home_score = game.hometeam.score
+            away_score = game.awayteam.score
+            
+            result = {
+                'home_team_id': home_team_id,
+                'away_team_id': away_team_id,
+                'home_score': home_score,
+                'away_score': away_score,
+                'home_boxscore': game.get_boxscore_display('home'),
+                'away_boxscore': game.get_boxscore_display('away'),
+                'game_completed': True
+            }
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error simulating game {home_team_id} vs {away_team_id}: {e}")
+            return {
+                'home_team_id': home_team_id,
+                'away_team_id': away_team_id,
+                'home_score': 0,
+                'away_score': 0,
+                'game_completed': False,
+                'error': str(e)
+            }
+    
+    def update_records_and_stats(self, game_result: Dict):
+        """Update team records and stats after a game."""
+        if not game_result['game_completed']:
+            return
+            
+        home_id = game_result['home_team_id']
+        away_id = game_result['away_team_id']
+        home_score = game_result['home_score']
+        away_score = game_result['away_score']
+        
+        # Update win/loss records
+        if home_score > away_score:
+            self.team_records[home_id]['W'] += 1
+            self.team_records[away_id]['L'] += 1
+        else:
+            self.team_records[home_id]['L'] += 1
+            self.team_records[away_id]['W'] += 1
+        
+        # Update points for/against
+        self.team_records[home_id]['PF'] += home_score
+        self.team_records[home_id]['PA'] += away_score
+        self.team_records[away_id]['PF'] += away_score
+        self.team_records[away_id]['PA'] += home_score
+        
+        # Update team aggregate stats
+        self._update_team_stats_from_boxscore(home_id, game_result['home_boxscore'])
+        self._update_team_stats_from_boxscore(away_id, game_result['away_boxscore'])
+        
+        # Update player season stats
+        self._update_player_stats_from_boxscore(home_id, game_result['home_boxscore'])
+        self._update_player_stats_from_boxscore(away_id, game_result['away_boxscore'])
+    
+    def _update_team_stats_from_boxscore(self, team_id: int, boxscore: pd.DataFrame):
+        """Update team aggregate stats from a boxscore."""
+        stats = self.team_stats[team_id]
+        stats['games_played'] += 1
+        
+        # Sum up stats from all players
+        for _, row in boxscore.iterrows():
+            stats['total_minutes'] += row.get('MIN', 0)
+            stats['total_points'] += row.get('PTS', 0)
+            stats['total_rebounds'] += row.get('REB', 0)
+            stats['total_assists'] += row.get('AST', 0)
+            stats['total_fgm'] += row.get('FGM', 0)
+            stats['total_fga'] += row.get('FGA', 0)
+            stats['total_3pm'] += row.get('3PM', 0)
+            stats['total_3pa'] += row.get('3PA', 0)
+            stats['total_ftm'] += row.get('FTM', 0)
+            stats['total_fta'] += row.get('FTA', 0)
+            stats['total_turnovers'] += row.get('TO', 0)
+            stats['total_fouls'] += row.get('PF', 0)
+    
+    def _update_player_stats_from_boxscore(self, team_id: int, boxscore: pd.DataFrame):
+        """Update player season stats from a boxscore."""
+        for player_id, row in boxscore.iterrows():
+            if player_id not in self.player_season_stats:
+                player_name = row.get('PLAYER', f'Player_{player_id}')
+                self.player_season_stats[player_id] = {
+                    'player_name': player_name,
+                    'team_id': team_id,
+                    'games_played': 0,
+                    'total_minutes': 0.0,
+                    'total_points': 0,
+                    'total_rebounds': 0,
+                    'total_assists': 0,
+                    'total_fgm': 0,
+                    'total_fga': 0,
+                    'total_3pm': 0,
+                    'total_3pa': 0,
+                    'total_ftm': 0,
+                    'total_fta': 0,
+                    'total_turnovers': 0,
+                    'total_fouls': 0,
+                    'total_plus_minus': 0
+                }
+            
+            player_stats = self.player_season_stats[player_id]
+            player_stats['games_played'] += 1
+            player_stats['total_minutes'] += row.get('MIN', 0)
+            player_stats['total_points'] += row.get('PTS', 0)
+            player_stats['total_rebounds'] += row.get('REB', 0)
+            player_stats['total_assists'] += row.get('AST', 0)
+            player_stats['total_fgm'] += row.get('FGM', 0)
+            player_stats['total_fga'] += row.get('FGA', 0)
+            player_stats['total_3pm'] += row.get('3PM', 0)
+            player_stats['total_3pa'] += row.get('3PA', 0)
+            player_stats['total_ftm'] += row.get('FTM', 0)
+            player_stats['total_fta'] += row.get('FTA', 0)
+            player_stats['total_turnovers'] += row.get('TO', 0)
+            player_stats['total_fouls'] += row.get('PF', 0)
+            player_stats['total_plus_minus'] += row.get('+/-', 0)
+    
+    def simulate_season(self, progress_callback=None):
+        """Simulate the entire season."""
+        print(f"\n🏀 Starting {self.season} season simulation...")
+        
+        # Generate schedule if not already done
+        if not any(self.schedule.values()):
+            self.generate_schedule()
+        
+        total_games = sum(len([g for g in schedule if g['result'] is None]) for schedule in self.schedule.values())
+        total_games = total_games // 2  # Each game counted twice (once per team)
+        
+        games_completed = 0
+        
+        # Process each team's schedule
+        for team_id in self.team_ids:
+            team_name = self.teams_df[self.teams_df['id'] == team_id]['nickname'].iloc[0]
+            print(f"\n📋 Processing {team_name} schedule...")
+            
+            for game in self.schedule[team_id]:
+                if game['result'] is not None:
+                    continue  # Game already simulated
+                
+                # Determine which team is home/away
+                if game['is_home']:
+                    home_id = team_id
+                    away_id = game['opponent_id']
+                else:
+                    home_id = game['opponent_id']
+                    away_id = team_id
+                
+                # Simulate the game
+                game_result = self.simulate_game(home_id, away_id)
+                
+                # Update game in both teams' schedules
+                game['result'] = game_result
+                
+                # Find and update the corresponding game in opponent's schedule
+                opponent_schedule = self.schedule[game['opponent_id']]
+                for opp_game in opponent_schedule:
+                    if (opp_game['opponent_id'] == team_id and 
+                        opp_game['is_home'] != game['is_home'] and 
+                        opp_game['result'] is None):
+                        opp_game['result'] = game_result
+                        break
+                
+                # Update records and stats
+                self.update_records_and_stats(game_result)
+                self.completed_games.append(game_result)
+                
+                games_completed += 1
+                
+                if games_completed % 10 == 0:
+                    print(f"   Completed {games_completed}/{total_games} games...")
+                
+                if progress_callback:
+                    progress_callback(games_completed, total_games)
+        
+        print(f"\n✅ Season simulation complete! {games_completed} games played.")
+    
+    def get_standings(self) -> pd.DataFrame:
+        """Get current league standings."""
+        standings_data = []
+        
+        for team_id in self.team_ids:
+            record = self.team_records[team_id]
+            team_name = self.teams_df[self.teams_df['id'] == team_id]['nickname'].iloc[0]
+            team_city = self.teams_df[self.teams_df['id'] == team_id]['city'].iloc[0]
+            
+            wins = record['W']
+            losses = record['L']
+            win_pct = wins / max(wins + losses, 1)
+            
+            standings_data.append({
+                'Team': f"{team_city} {team_name}",
+                'W': wins,
+                'L': losses,
+                'PCT': f"{win_pct:.3f}",
+                'PF': record['PF'],
+                'PA': record['PA'],
+                'DIFF': record['PF'] - record['PA']
+            })
+        
+        standings_df = pd.DataFrame(standings_data)
+        standings_df = standings_df.sort_values(['PCT', 'DIFF'], ascending=[False, False])
+        standings_df.index = range(1, len(standings_df) + 1)
+        
+        return standings_df
+    
+    def get_team_averages(self, team_id: int) -> Dict:
+        """Get per-game averages for a team."""
+        stats = self.team_stats[team_id]
+        record = self.team_records[team_id]
+        
+        if stats['games_played'] == 0:
+            return {}
+        
+        return {
+            'games_played': stats['games_played'],
+            'wins': record['W'],
+            'losses': record['L'],
+            'win_pct': record['W'] / max(record['W'] + record['L'], 1),
+            'points_per_game': stats['total_points'] / stats['games_played'],
+            'rebounds_per_game': stats['total_rebounds'] / stats['games_played'],
+            'assists_per_game': stats['total_assists'] / stats['games_played'],
+            'fg_pct': stats['total_fgm'] / max(stats['total_fga'], 1) * 100,
+            'three_pct': stats['total_3pm'] / max(stats['total_3pa'], 1) * 100,
+            'ft_pct': stats['total_ftm'] / max(stats['total_fta'], 1) * 100,
+            'turnovers_per_game': stats['total_turnovers'] / stats['games_played'],
+            'fouls_per_game': stats['total_fouls'] / stats['games_played']
+        }
+    
+    def get_player_averages(self, player_id: int = None) -> pd.DataFrame:
+        """Get per-game averages for players."""
+        if player_id:
+            # Return specific player
+            if player_id not in self.player_season_stats:
+                return pd.DataFrame()
+            
+            stats = self.player_season_stats[player_id]
+            if stats['games_played'] == 0:
+                return pd.DataFrame()
+            
+            return pd.DataFrame([{
+                'Player': stats['player_name'],
+                'Team': self.teams_df[self.teams_df['id'] == stats['team_id']]['nickname'].iloc[0],
+                'GP': stats['games_played'],
+                'MIN': stats['total_minutes'] / stats['games_played'],
+                'PTS': stats['total_points'] / stats['games_played'],
+                'REB': stats['total_rebounds'] / stats['games_played'],
+                'AST': stats['total_assists'] / stats['games_played'],
+                'FG%': stats['total_fgm'] / max(stats['total_fga'], 1) * 100,
+                '3P%': stats['total_3pm'] / max(stats['total_3pa'], 1) * 100,
+                'FT%': stats['total_ftm'] / max(stats['total_fta'], 1) * 100,
+                'TO': stats['total_turnovers'] / stats['games_played'],
+                'PF': stats['total_fouls'] / stats['games_played'],
+                '+/-': stats['total_plus_minus'] / stats['games_played']
+            }])
+        
+        else:
+            # Return all players with minimum games played
+            min_games = 10  # Minimum games to appear in leaderboards
+            
+            player_data = []
+            for pid, stats in self.player_season_stats.items():
+                if stats['games_played'] >= min_games:
+                    team_name = self.teams_df[self.teams_df['id'] == stats['team_id']]['nickname'].iloc[0]
+                    
+                    player_data.append({
+                        'Player': stats['player_name'],
+                        'Team': team_name,
+                        'GP': stats['games_played'],
+                        'MIN': stats['total_minutes'] / stats['games_played'],
+                        'PTS': stats['total_points'] / stats['games_played'],
+                        'REB': stats['total_rebounds'] / stats['games_played'],
+                        'AST': stats['total_assists'] / stats['games_played'],
+                        'FG%': stats['total_fgm'] / max(stats['total_fga'], 1) * 100,
+                        '3P%': stats['total_3pm'] / max(stats['total_3pa'], 1) * 100,
+                        'FT%': stats['total_ftm'] / max(stats['total_fta'], 1) * 100,
+                        'TO': stats['total_turnovers'] / stats['games_played'],
+                        'PF': stats['total_fouls'] / stats['games_played'],
+                        '+/-': stats['total_plus_minus'] / stats['games_played']
+                    })
+            
+            df = pd.DataFrame(player_data)
+            return df.sort_values('PTS', ascending=False)
+    
+    def get_leaders(self, stat: str, limit: int = 10) -> pd.DataFrame:
+        """Get league leaders for a specific stat."""
+        player_averages = self.get_player_averages()
+        
+        if player_averages.empty:
+            return pd.DataFrame()
+        
+        if stat not in player_averages.columns:
+            print(f"❌ Stat '{stat}' not found. Available stats: {list(player_averages.columns)}")
+            return pd.DataFrame()
+        
+        # Sort by the requested stat (descending for most stats, ascending for turnovers/fouls)
+        ascending = stat in ['TO', 'PF']
+        
+        leaders = player_averages.sort_values(stat, ascending=ascending).head(limit)
+        leaders = leaders.reset_index(drop=True)
+        leaders.index = range(1, len(leaders) + 1)
+        
+        return leaders[['Player', 'Team', 'GP', stat]]
+    
+    def get_team_name(self, team_id: int) -> str:
+        """Get full team name from team ID."""
+        team_row = self.teams_df[self.teams_df['id'] == team_id]
+        if not team_row.empty:
+            return f"{team_row.iloc[0]['city']} {team_row.iloc[0]['nickname']}"
+        return f"Team_{team_id}"
+    
+    def print_season_summary(self):
+        """Print a comprehensive season summary."""
+        print(f"\n🏆 {self.season} NBA Season Summary")
+        print("=" * 50)
+        
+        # Standings
+        standings = self.get_standings()
+        print(f"\n📊 Final Standings (Top 10):")
+        print(standings.head(10).to_string())
+        
+        # Scoring leaders
+        print(f"\n🔥 Scoring Leaders:")
+        scoring_leaders = self.get_leaders('PTS', 5)
+        print(scoring_leaders.to_string())
+        
+        # Rebounding leaders
+        print(f"\n🏀 Rebounding Leaders:")
+        reb_leaders = self.get_leaders('REB', 5)
+        print(reb_leaders.to_string())
+        
+        # Assist leaders
+        print(f"\n🎯 Assist Leaders:")
+        ast_leaders = self.get_leaders('AST', 5)
+        print(ast_leaders.to_string())
+        
+        # League-wide stats
+        total_games = len(self.completed_games)
+        print(f"\n📈 League Statistics:")
+        print(f"   Total Games Played: {total_games}")
+        print(f"   Teams: {self.num_teams}")
+        
+        # Calculate average points per game across all teams
+        total_points = 0
+        games_with_scores = 0
+        
+        for game in self.completed_games:
+            if game['game_completed']:
+                total_points += game['home_score'] + game['away_score']
+                games_with_scores += 1
+        
+        if games_with_scores > 0:
+            avg_ppg = total_points / games_with_scores / 2  # Average per team per game
+            print(f"   Average Points Per Game: {avg_ppg:.1f}")
+
+
+# Example usage function
+def run_season_simulation(season: str = '2024-25', max_games: int = 10):
+    """
+    Example function to run a season simulation.
+    
+    Args:
+        season: NBA season to simulate
+        max_games: Maximum games per team (use 10 for quick testing, 82 for full season)
+    """
+    print(f"🚀 Starting NBA Season Simulation")
+    print(f"   Season: {season}")
+    print(f"   Games per team: {max_games}")
+    
+    # Initialize season
+    season_sim = Season(season=season, max_games_per_team=max_games)
+    
+    # Run simulation
+    season_sim.simulate_season()
+    
+    # Print results
+    season_sim.print_season_summary()
+    
+    return season_sim
+
+
+if __name__ == "__main__":
+    # Example usage
+    season = run_season_simulation(max_games=5)  # Quick test with 5 games per team

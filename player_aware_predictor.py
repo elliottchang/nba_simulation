@@ -23,8 +23,8 @@ class PlayerAwarePredictor:
     
     def __init__(
         self,
-        model_path: str = 'possession_model.pt',
-        feature_engineer_path: str = 'feature_engineer.pkl',
+        model_path: str = 'models/possession_model.pt',
+        feature_engineer_path: str = 'features/feature_engineer.pkl',
         device: str = 'cpu'
     ):
         """Load model and feature engineer."""
@@ -50,6 +50,7 @@ class PlayerAwarePredictor:
         self.model.eval()
         
         print(f"Loaded model from {model_path}")
+        
     
     def get_player_tendencies(self, player_id: int, season: str) -> Dict:
         """
@@ -224,17 +225,17 @@ class PlayerAwarePredictor:
         
         # Build action distribution
         action_probs = {
-            '2PT_attempt': tendencies['2pt_rate'] * player_weight,
-            '3PT_attempt': tendencies['3pt_rate'] * player_weight,
+            '2pt_attempt': tendencies['2pt_rate'] * player_weight,
+            '3pt_attempt': tendencies['3pt_rate'] * player_weight,
             'TO': tendencies['to_rate'] * player_weight,
         }
         
         # Add lineup influence
         for outcome, prob in self.fe.idx_to_outcome.items():
-            if '2PT' in prob:
-                action_probs['2PT_attempt'] += lineup_probs[outcome].item() * lineup_weight / 2
-            elif '3PT' in prob:
-                action_probs['3PT_attempt'] += lineup_probs[outcome].item() * lineup_weight / 2
+            if '2pt' in prob:
+                action_probs['2pt_attempt'] += lineup_probs[outcome].item() * lineup_weight / 2
+            elif '3pt' in prob:
+                action_probs['3pt_attempt'] += lineup_probs[outcome].item() * lineup_weight / 2
             elif 'TO' in prob:
                 action_probs['TO'] += lineup_probs[outcome].item() * lineup_weight
         
@@ -263,11 +264,11 @@ class PlayerAwarePredictor:
         
         Args:
             player_id: Player taking the action
-            action: '2PT_attempt', '3PT_attempt', or 'TO'
+            action: '2pt_attempt', '3pt_attempt', or 'TO'
             season: Season string
         
         Returns:
-            Full outcome: '2PT_make', '2PT_miss', etc.
+            Full outcome: '2pt_make', '2pt_miss', etc.
         """
         if action == 'TO':
             return 'TO'
@@ -275,19 +276,19 @@ class PlayerAwarePredictor:
         # Get player's shooting percentage
         tendencies = self.get_player_tendencies(player_id, season)
         
-        if action == '2PT_attempt':
+        if action == '2pt_attempt':
             make_prob = tendencies['2pt_pct']
             if random.random() < make_prob:
-                return '2PT_make'
+                return '2pt_make'
             else:
-                return '2PT_miss'
+                return '2pt_miss'
         
-        elif action == '3PT_attempt':
+        elif action == '3pt_attempt':
             make_prob = tendencies['3pt_pct']
             if random.random() < make_prob:
-                return '3PT_make'
+                return '3pt_make'
             else:
-                return '3PT_miss'
+                return '3pt_miss'
         
         return 'TO'
     
@@ -307,7 +308,7 @@ class PlayerAwarePredictor:
         
         Args:
             player_id: Player taking the action
-            action: '2PT_attempt', '3PT_attempt', or 'TO'
+            action: '2pt_attempt', '3pt_attempt', or 'TO'
             season: Season string
             fatigue_multiplier: 0.5 (exhausted) to 1.0 (fresh)
         
@@ -320,7 +321,7 @@ class PlayerAwarePredictor:
         # Get player's base shooting percentage
         tendencies = self.get_player_tendencies(player_id, season)
         
-        if action == '2PT_attempt':
+        if action == '2pt_attempt':
             # Apply fatigue to shooting percentage
             base_pct = tendencies['2pt_pct']
             fatigued_pct = base_pct * fatigue_multiplier
@@ -331,11 +332,11 @@ class PlayerAwarePredictor:
             if random.random() < turnover_chance:
                 return 'TO'
             elif random.random() < fatigued_pct:
-                return '2PT_make'
+                return '2pt_make'
             else:
-                return '2PT_miss'
+                return '2pt_miss'
         
-        elif action == '3PT_attempt':
+        elif action == '3pt_attempt':
             # Apply fatigue to shooting percentage
             base_pct = tendencies['3pt_pct']
             fatigued_pct = base_pct * fatigue_multiplier
@@ -346,9 +347,9 @@ class PlayerAwarePredictor:
             if random.random() < turnover_chance:
                 return 'TO'
             elif random.random() < fatigued_pct:
-                return '3PT_make'
+                return '3pt_make'
             else:
-                return '3PT_miss'
+                return '3pt_miss'
         
         return 'TO'
     
@@ -365,9 +366,8 @@ class PlayerAwarePredictor:
         Full player-aware possession prediction with fatigue effects.
         
         Process:
-        1. Select which player (usage-weighted, adjusted for fatigue)
-        2. Determine action type (player tendencies + lineup context)
-        3. Determine success (player shooting percentage, reduced by fatigue)
+        1. Use trained model to predict from 11 outcome categories
+        2. Select which player (usage-weighted, adjusted for fatigue)
         
         Args:
             offensive_lineup: 5 offensive player IDs
@@ -384,22 +384,48 @@ class PlayerAwarePredictor:
         if fatigue_multipliers is None:
             fatigue_multipliers = {}
         
-        # Step 1: Select player (usage-weighted with fatigue adjustment)
+        # Step 1: Use trained model to predict outcome directly
+        unk_idx = self.fe.player_to_idx[('UNK', 'UNK')]
+        
+        offensive_indices = []
+        for pid in offensive_lineup[:5]:
+            key = (int(pid), season)
+            idx_val = self.fe.player_to_idx.get(key, unk_idx)
+            offensive_indices.append(idx_val)
+        
+        defensive_indices = []
+        for pid in defensive_lineup[:5]:
+            key = (int(pid), season)
+            idx_val = self.fe.player_to_idx.get(key, unk_idx)
+            defensive_indices.append(idx_val)
+        
+        # Pad if necessary
+        while len(offensive_indices) < 5:
+            offensive_indices.append(unk_idx)
+        while len(defensive_indices) < 5:
+            defensive_indices.append(unk_idx)
+        
+        context = np.array([score_margin, period], dtype=np.float32)
+        
+        # Get model prediction
+        offensive_tensor = torch.tensor([offensive_indices], dtype=torch.long).to(self.device)
+        defensive_tensor = torch.tensor([defensive_indices], dtype=torch.long).to(self.device)
+        context_tensor = torch.tensor(context.reshape(1, -1), dtype=torch.float32).to(self.device)
+        
+        with torch.no_grad():
+            outcome_logits = self.model(offensive_tensor, defensive_tensor, context_tensor)
+            outcome_probs = F.softmax(outcome_logits, dim=1)[0]
+            
+            
+            # Sample from the 11 outcome categories
+            outcome_indices = list(range(len(self.fe.outcome_to_idx)))
+            weights = outcome_probs.cpu().numpy()
+            selected_idx = random.choices(outcome_indices, weights=weights, k=1)[0]
+            outcome = self.fe.idx_to_outcome[selected_idx]
+    
+        
+        # Step 2: Select player (usage-weighted with fatigue adjustment)
         player_id = self.select_player_with_fatigue(offensive_lineup, season, fatigue_multipliers)
-        
-        # Step 2: Determine action
-        action = self.predict_player_action(
-            player_id=player_id,
-            season=season,
-            offensive_lineup=offensive_lineup,
-            defensive_lineup=defensive_lineup,
-            score_margin=score_margin,
-            period=period
-        )
-        
-        # Step 3: Determine outcome (with fatigue affecting shooting %)
-        fatigue_mult = fatigue_multipliers.get(player_id, 1.0)
-        outcome = self.predict_outcome_with_fatigue(player_id, action, season, fatigue_mult)
         
         # Build detailed result
         result = {
@@ -416,24 +442,52 @@ class PlayerAwarePredictor:
             'possession_changes': True
         }
         
-        # Map outcome to stats
-        if outcome == '2PT_make':
+        # Map outcome to stats - handle all 11 outcome categories
+        if outcome == '2pt_make':
             result['points'] = 2
             result['fga'] = 1
             result['fgm'] = 1
-        elif outcome == '2PT_miss':
+        elif outcome == '2pt_miss':
             result['fga'] = 1
-        elif outcome == '3PT_make':
+        elif outcome == '3pt_make':
             result['points'] = 3
             result['fga'] = 1
             result['fgm'] = 1
             result['3pa'] = 1
             result['3pm'] = 1
-        elif outcome == '3PT_miss':
+        elif outcome == '3pt_miss':
             result['fga'] = 1
             result['3pa'] = 1
+        elif outcome == '2pt_andone':
+            result['points'] = 2
+            result['fga'] = 1
+            result['fgm'] = 1
+            result['fta'] = 1
+            # FT will be handled in the main game engine
+        elif outcome == '3pt_andone':
+            result['points'] = 3
+            result['fga'] = 1
+            result['fgm'] = 1
+            result['3pa'] = 1
+            result['3pm'] = 1
+            result['fta'] = 1
+            # FT will be handled in the main game engine
+        elif outcome == '2pt_foul':
+            result['fga'] = 1
+            result['fta'] = 2
+            # FTs will be handled in the main game engine
+        elif outcome == '3pt_foul':
+            result['fga'] = 1
+            result['3pa'] = 1
+            result['fta'] = 3
+            # FTs will be handled in the main game engine
         elif outcome == 'TO':
             result['to'] = 1
+        elif outcome == 'off_foul':
+            result['to'] = 1  # Offensive foul is a turnover
+        elif outcome == 'def_foul':
+            # Defensive foul doesn't change stats for offensive player
+            pass
         
         return result
     
