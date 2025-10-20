@@ -472,11 +472,8 @@ class GameEngine:
         if not self.deadball:
             return
         
-        # Between quarters - bring back starters
-        if self.quarter_duration <= 0:
-            self.hometeam.lineup = self.hometeam.starters.copy()
-            self.awayteam.lineup = self.awayteam.starters.copy()
-            return
+        # Lineup resets are now handled in the quarter transition logic
+        # to ensure proper timing relative to game end conditions
         
         # Make substitutions for both teams
         close_game = self.is_close_game()
@@ -962,6 +959,9 @@ class GameEngine:
                 self.quarter += 1
                 if self.quarter <= 4:
                     self.quarter_duration = 12 * 60  # Reset to 12 minutes for next quarter
+                    # Reset lineups to starters when starting new quarter
+                    self.hometeam.lineup = self.hometeam.starters.copy()
+                    self.awayteam.lineup = self.awayteam.starters.copy()
                     print(f"Starting Quarter {self.quarter}")
                 else:
                     # Regular time is over - check for overtime
@@ -970,10 +970,14 @@ class GameEngine:
                         print("🏀 OVERTIME NEEDED!")
                         self.quarter = 5  # First overtime
                         self.quarter_duration = self.ot_duration  # 5 minutes
+                        # Reset lineups to starters for overtime
+                        self.hometeam.lineup = self.hometeam.starters.copy()
+                        self.awayteam.lineup = self.awayteam.starters.copy()
                         print(f"Starting Overtime {self.quarter - 4}")
                     else:
                         winner = self.hometeam.team_abbr if self.hometeam.score > self.awayteam.score else self.awayteam.team_abbr
                         print(f"🏆 GAME OVER! {winner} wins!")
+                        self.quarter = 999  # Mark game as completely finished
             else:
                 # This is an overtime period (quarter 5+)
                 ot_num = self.quarter - 4
@@ -985,6 +989,9 @@ class GameEngine:
                     self.quarter += 1
                     ot_num = self.quarter - 4
                     self.quarter_duration = self.ot_duration  # 5 minutes
+                    # Reset lineups to starters for additional overtime
+                    self.hometeam.lineup = self.hometeam.starters.copy()
+                    self.awayteam.lineup = self.awayteam.starters.copy()
                     print(f"🏀 Another Overtime needed! Starting Overtime {ot_num}")
                 else:
                     # Overtime winner found
@@ -1176,43 +1183,146 @@ class Season:
         }
     
     def generate_schedule(self):
-        """Generate a simplified NBA schedule."""
+        """Generate a coordinated NBA schedule ensuring each team plays exactly max_games_per_team games."""
         print("📅 Generating schedule...")
         
-        # Create a round-robin schedule with some modifications
-        for team_id in self.team_ids:
-            opponents = [tid for tid in self.team_ids if tid != team_id]
-            random.shuffle(opponents)
-            
-            games_needed = self.max_games_per_team
-            games_added = 0
-            
-            # Add games against each opponent multiple times to reach 82 games
-            while games_added < games_needed:
-                for opponent_id in opponents:
-                    if games_added >= games_needed:
-                        break
-                    
-                    # Randomly assign home/away
-                    is_home = random.choice([True, False])
-                    
-                    self.schedule[team_id].append({
-                        'opponent_id': opponent_id,
-                        'is_home': is_home,
-                        'result': None,  # Will be filled after game simulation
-                        'game_id': f"{team_id}_{opponent_id}_{games_added}"
-                    })
-                    games_added += 1
-                    
-                    # Stop if we've added enough games
-                    if games_added >= games_needed:
-                        break
-                        
-                # Reshuffle opponents for variety
-                random.shuffle(opponents)
+        # Create a global list of all games to ensure no duplicates
+        all_games = []
+        games_per_team = {team_id: 0 for team_id in self.team_ids}
         
-        total_games = sum(len(schedule) for schedule in self.schedule.values())
-        print(f"   Generated {total_games // 2} total games (since each game appears in both teams' schedules)")
+        # Continue adding games until each team has played the required number
+        while min(games_per_team.values()) < self.max_games_per_team:
+            # Shuffle team order for randomness
+            teams_to_consider = [tid for tid in self.team_ids if games_per_team[tid] < self.max_games_per_team]
+            
+            if len(teams_to_consider) < 2:
+                break  # Can't create more games if fewer than 2 teams need games
+                
+            random.shuffle(teams_to_consider)
+            
+            for team_id in teams_to_consider:
+                if games_per_team[team_id] >= self.max_games_per_team:
+                    continue
+                    
+                # Find potential opponents who also need games
+                potential_opponents = [tid for tid in self.team_ids 
+                                     if tid != team_id and games_per_team[tid] < self.max_games_per_team]
+                
+                if not potential_opponents:
+                    continue
+                    
+                opponent_id = random.choice(potential_opponents)
+                
+                # Check if this matchup already exists recently (avoid immediate rematches)
+                recent_games = all_games[-10:] if len(all_games) >= 10 else all_games
+                recent_matchup = any(
+                    (g['home_id'] == team_id and g['away_id'] == opponent_id) or
+                    (g['home_id'] == opponent_id and g['away_id'] == team_id)
+                    for g in recent_games
+                )
+                
+                # If too recent, try a different opponent
+                if len(potential_opponents) > 1 and recent_matchup:
+                    other_opponents = [tid for tid in potential_opponents if tid != opponent_id]
+                    if other_opponents:
+                        opponent_id = random.choice(other_opponents)
+                
+                # Randomly assign home/away (but prefer to balance home/away for each team)
+                home_away_balance = sum(1 for g in all_games if g['home_id'] == team_id) - \
+                                  sum(1 for g in all_games if g['away_id'] == team_id)
+                
+                if abs(home_away_balance) < 2 and random.random() < 0.5:
+                    # Try to balance home/away
+                    is_home = home_away_balance <= 0
+                else:
+                    is_home = random.choice([True, False])
+                
+                # Create the game
+                game_id = f"game_{len(all_games)}_{team_id}_{opponent_id}"
+                game = {
+                    'home_id': team_id if is_home else opponent_id,
+                    'away_id': opponent_id if is_home else team_id,
+                    'result': None,
+                    'game_id': game_id
+                }
+                
+                all_games.append(game)
+                games_per_team[team_id] += 1
+                games_per_team[opponent_id] += 1
+                
+                # Stop if we've reached the limit for all teams
+                if min(games_per_team.values()) >= self.max_games_per_team:
+                    break
+        
+        # Convert global game list to per-team schedules
+        for game in all_games:
+            home_id = game['home_id']
+            away_id = game['away_id']
+            
+            # Add to home team's schedule
+            self.schedule[home_id].append({
+                'opponent_id': away_id,
+                'is_home': True,
+                'result': None,
+                'game_id': game['game_id']
+            })
+            
+            # Add to away team's schedule
+            self.schedule[away_id].append({
+                'opponent_id': home_id,
+                'is_home': False,
+                'result': None,
+                'game_id': game['game_id']
+            })
+        
+        # Verify each team has the correct number of games
+        for team_id in self.team_ids:
+            actual_games = len(self.schedule[team_id])
+            if actual_games != self.max_games_per_team:
+                print(f"⚠️  Warning: Team {team_id} has {actual_games} games instead of {self.max_games_per_team}")
+        
+        total_games = len(all_games)
+        print(f"   Generated {total_games} total games")
+        print(f"   Each team should play exactly {self.max_games_per_team} games")
+        
+        # Verify schedule integrity
+        self._verify_schedule_integrity()
+    
+    def _verify_schedule_integrity(self):
+        """Verify that the schedule is properly coordinated between teams."""
+        # Collect all games by ID to check for consistency
+        all_games = {}
+        
+        for team_id in self.team_ids:
+            for game in self.schedule[team_id]:
+                game_id = game['game_id']
+                if game_id not in all_games:
+                    all_games[game_id] = {
+                        'home_team_id': game['opponent_id'] if not game['is_home'] else team_id,
+                        'away_team_id': team_id if not game['is_home'] else game['opponent_id'],
+                        'teams_seen': set()
+                    }
+                
+                all_games[game_id]['teams_seen'].add(team_id)
+        
+        # Check that each game has exactly 2 teams involved
+        for game_id, game_info in all_games.items():
+            if len(game_info['teams_seen']) != 2:
+                print(f"⚠️  Warning: Game {game_id} has {len(game_info['teams_seen'])} teams instead of 2")
+            
+            # Check that home/away is consistent
+            expected_home = game_info['home_team_id']
+            expected_away = game_info['away_team_id']
+            
+            # Verify this in both teams' schedules
+            home_schedule = self.schedule.get(expected_home, [])
+            away_schedule = self.schedule.get(expected_away, [])
+            
+            home_game_found = any(g['game_id'] == game_id and g['is_home'] for g in home_schedule)
+            away_game_found = any(g['game_id'] == game_id and not g['is_home'] for g in away_schedule)
+            
+            if not home_game_found or not away_game_found:
+                print(f"⚠️  Warning: Game {game_id} home/away assignment inconsistent")
     
     def simulate_game(self, home_team_id: int, away_team_id: int) -> Dict:
         """
@@ -1359,56 +1469,68 @@ class Season:
         if not any(self.schedule.values()):
             self.generate_schedule()
         
-        total_games = sum(len([g for g in schedule if g['result'] is None]) for schedule in self.schedule.values())
-        total_games = total_games // 2  # Each game counted twice (once per team)
+        # Collect all unique games by game_id to avoid duplicates
+        all_games_by_id = {}
+        for team_id in self.team_ids:
+            for game in self.schedule[team_id]:
+                if game['result'] is None:  # Only process unsimulated games
+                    game_id = game['game_id']
+                    if game_id not in all_games_by_id:
+                        # Determine home/away teams for this game
+                        if game['is_home']:
+                            home_id = team_id
+                            away_id = game['opponent_id']
+                        else:
+                            home_id = game['opponent_id']
+                            away_id = team_id
+                        
+                        all_games_by_id[game_id] = {
+                            'game_id': game_id,
+                            'home_id': home_id,
+                            'away_id': away_id,
+                            'team_schedules': [(team_id, game)]  # Track which team schedules contain this game
+                        }
+                    else:
+                        # Add this team's schedule entry to the existing game
+                        all_games_by_id[game_id]['team_schedules'].append((team_id, game))
         
+        total_games = len(all_games_by_id)
         games_completed = 0
         
-        # Process each team's schedule
-        for team_id in self.team_ids:
-            team_name = self.teams_df[self.teams_df['id'] == team_id]['nickname'].iloc[0]
-            print(f"\n📋 Processing {team_name} schedule...")
+        print(f"   Found {total_games} unique games to simulate")
+        
+        # Simulate each unique game once
+        for game_id, game_info in all_games_by_id.items():
+            home_id = game_info['home_id']
+            away_id = game_info['away_id']
             
-            for game in self.schedule[team_id]:
-                if game['result'] is not None:
-                    continue  # Game already simulated
-                
-                # Determine which team is home/away
-                if game['is_home']:
-                    home_id = team_id
-                    away_id = game['opponent_id']
-                else:
-                    home_id = game['opponent_id']
-                    away_id = team_id
-                
-                # Simulate the game
-                game_result = self.simulate_game(home_id, away_id)
-                
-                # Update game in both teams' schedules
-                game['result'] = game_result
-                
-                # Find and update the corresponding game in opponent's schedule
-                opponent_schedule = self.schedule[game['opponent_id']]
-                for opp_game in opponent_schedule:
-                    if (opp_game['opponent_id'] == team_id and 
-                        opp_game['is_home'] != game['is_home'] and 
-                        opp_game['result'] is None):
-                        opp_game['result'] = game_result
-                        break
-                
-                # Update records and stats
-                self.update_records_and_stats(game_result)
-                self.completed_games.append(game_result)
-                
-                games_completed += 1
-                
-                if games_completed % 10 == 0:
-                    print(f"   Completed {games_completed}/{total_games} games...")
-                
-                if progress_callback:
-                    progress_callback(games_completed, total_games)
+            # Simulate the game
+            game_result = self.simulate_game(home_id, away_id)
+            
+            # Update the result in all team schedules that contain this game
+            for team_id, schedule_entry in game_info['team_schedules']:
+                schedule_entry['result'] = game_result
+            
+            # Update records and stats
+            self.update_records_and_stats(game_result)
+            self.completed_games.append(game_result)
+            
+            games_completed += 1
+            
+            if games_completed % 10 == 0:
+                print(f"   Completed {games_completed}/{total_games} games...")
+            
+            if progress_callback:
+                progress_callback(games_completed, total_games)
         
         print(f"\n✅ Season simulation complete! {games_completed} games played.")
+        
+        # Verify each team played the expected number of games
+        for team_id in self.team_ids:
+            completed_games_for_team = len([g for g in self.schedule[team_id] if g['result'] is not None])
+            if completed_games_for_team != self.max_games_per_team:
+                team_name = self.teams_df[self.teams_df['id'] == team_id]['nickname'].iloc[0]
+                print(f"⚠️  Warning: {team_name} played {completed_games_for_team} games instead of {self.max_games_per_team}")
     
     def get_standings(self) -> pd.DataFrame:
         """Get current league standings."""
