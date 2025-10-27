@@ -1,0 +1,13 @@
+# Core dependencies
+torch>=2.0.0
+pandas>=1.5.0
+numpy>=1.24.0
+nba-api>=1.2.1
+
+# Data engineering dependencies
+snowflake-connector-python>=3.0.0
+python-dotenv>=1.0.0
+
+# Optional: For better Snowflake performance
+snowflake-sqlalchemy>=1.4.0
+sqlalchemy>=1.4.0
