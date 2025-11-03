@@ -173,7 +173,8 @@ class SnowflakeClient:
         primary_key_columns: List[str]
     ) -> None:
         """
-        Upsert data to Snowflake table.
+        Upsert data to Snowflake table using MERGE to avoid duplicates.
+        This properly handles the case where data already exists in the table.
         
         Args:
             df: DataFrame to upsert
@@ -191,70 +192,82 @@ class SnowflakeClient:
             with conn.cursor() as cursor:
                 cursor.execute(f"USE SCHEMA {self.config.database}.{self.config.schema}")
             
-            try:
-                # Try write_pandas first (preferred method)
-                success, nchunks, nrows, _ = write_pandas(
-                    conn=conn,
-                    df=df,
-                    table_name=table_name,
-                    auto_create_table=False,
-                    overwrite=False,
-                    chunk_size=10000
-                )
+            # Use MERGE for proper upsert behavior
+            with conn.cursor() as cursor:
+                import json
                 
-                if success:
-                    logger.info(f"Successfully upserted {nrows} rows to {table_name}")
-                else:
-                    raise Exception("write_pandas returned failure")
-                    
-            except Exception as pandas_error:
-                logger.warning(f"write_pandas failed ({pandas_error}), trying direct SQL insert")
+                # Get all column names
+                all_columns = df.columns.tolist()
+                # Exclude collected_at from updates (it should remain as the original insert time)
+                update_columns = [col for col in all_columns if col != 'collected_at']
                 
-                # Fallback: Use direct SQL INSERT with proper VARIANT handling
-                with conn.cursor() as cursor:
-                    import json
+                rows_processed = 0
+                
+                for _, row in df.iterrows():
+                    # Build values for the MERGE statement
+                    select_parts = []
                     
-                    # Build individual INSERT statements using SELECT for VARIANT handling
-                    for _, row in df.iterrows():
-                        # Build SELECT statement which supports PARSE_JSON
-                        select_parts = []
+                    for col in all_columns:
+                        val = row[col]
                         
-                        for col in df.columns:
-                            val = row[col]
-                            
-                            if col.endswith(('_starters', '_roster', '_lineup')):
-                                # Handle VARIANT columns with PARSE_JSON in SELECT
-                                if isinstance(val, (list, dict)):
-                                    json_str = json.dumps(val)
-                                elif isinstance(val, str) and val.startswith(('{', '[')):
-                                    json_str = val
-                                else:
-                                    json_str = '[]'
-                                
-                                # Escape single quotes for SQL
-                                escaped_json = json_str.replace("'", "''")
-                                select_parts.append(f"PARSE_JSON('{escaped_json}') AS {col}")
+                        if col.endswith(('_starters', '_roster', '_lineup')):
+                            # Handle VARIANT columns with PARSE_JSON
+                            if isinstance(val, (list, dict)):
+                                json_str = json.dumps(val)
+                            elif isinstance(val, str) and val.startswith(('{', '[')):
+                                json_str = val
                             else:
-                                # Regular columns
-                                if pd.isna(val):
-                                    select_parts.append(f"NULL AS {col}")
-                                elif isinstance(val, str):
-                                    escaped_val = val.replace("'", "''")
-                                    select_parts.append(f"'{escaped_val}' AS {col}")
-                                elif isinstance(val, (int, float)):
-                                    select_parts.append(f"{val} AS {col}")
-                                else:
-                                    select_parts.append(f"'{str(val)}' AS {col}")
-                        
-                        # Build the INSERT ... SELECT statement
-                        columns_str = ', '.join(df.columns)
-                        select_str = ', '.join(select_parts)
-                        insert_sql = f"INSERT INTO {table_name} ({columns_str}) SELECT {select_str}"
-                        
-                        cursor.execute(insert_sql)
+                                json_str = '[]'
+                            
+                            # Escape single quotes for SQL
+                            escaped_json = json_str.replace("'", "''")
+                            select_parts.append(f"PARSE_JSON('{escaped_json}') AS {col}")
+                        else:
+                            # Regular columns
+                            if pd.isna(val):
+                                select_parts.append(f"NULL AS {col}")
+                            elif isinstance(val, str):
+                                escaped_val = val.replace("'", "''")
+                                select_parts.append(f"'{escaped_val}' AS {col}")
+                            elif isinstance(val, (int, float)):
+                                select_parts.append(f"{val} AS {col}")
+                            else:
+                                select_parts.append(f"'{str(val)}' AS {col}")
                     
-                    nrows = len(df)
-                    logger.info(f"Successfully inserted {nrows} rows to {table_name} using direct SQL")
+                    # Build merge conditions (match on primary key)
+                    merge_conditions = []
+                    for pk_col in primary_key_columns:
+                        merge_conditions.append(f"t.{pk_col} = s.{pk_col}")
+                    
+                    # Build update assignments (exclude collected_at and primary key columns)
+                    update_assignments = []
+                    for col in update_columns:
+                        if col not in primary_key_columns:
+                            update_assignments.append(f"t.{col} = s.{col}")
+                    
+                    # Build columns string for INSERT
+                    columns_str = ', '.join(all_columns)
+                    select_str = ', '.join(select_parts)
+                    conditions_str = ' AND '.join(merge_conditions)
+                    updates_str = ', '.join(update_assignments) if update_assignments else '1=1'
+                    values_str = ', '.join([f"s.{col}" for col in all_columns])
+                    
+                    # Build the MERGE statement
+                    merge_sql = f"""
+                        MERGE INTO {table_name} AS t
+                        USING (SELECT {select_str}) AS s
+                        ON {conditions_str}
+                        WHEN MATCHED THEN
+                            UPDATE SET {updates_str}
+                        WHEN NOT MATCHED THEN
+                            INSERT ({columns_str})
+                            VALUES ({values_str})
+                    """
+                    
+                    cursor.execute(merge_sql)
+                    rows_processed += 1
+                
+                logger.info(f"Successfully upserted {rows_processed} rows to {table_name} using MERGE")
                 
         except Exception as e:
             logger.error(f"Error upserting data to {table_name}: {e}")
@@ -276,7 +289,7 @@ class SnowflakeClient:
                 season,
                 COUNT(DISTINCT game_id) as games_collected,
                 COUNT(*) as total_events
-            FROM play_by_play_events 
+            FROM PLAY_BY_PLAY_EVENTS 
             WHERE season IN ({','.join([f"'{s}'" for s in seasons])})
             GROUP BY season
             ORDER BY season
@@ -284,6 +297,8 @@ class SnowflakeClient:
         
         try:
             result_df = self.query_data(status_sql)
+            # Snowflake returns column names in uppercase, normalize to lowercase
+            result_df.columns = result_df.columns.str.lower()
             return result_df.set_index('season').to_dict('index')
         except Exception as e:
             logger.warning(f"Could not get collection status: {e}")
@@ -293,16 +308,59 @@ class SnowflakeClient:
         """Get set of game IDs that have already been processed."""
         processed_sql = f"""
             SELECT DISTINCT game_id 
-            FROM game_metadata 
+            FROM GAME_METADATA 
             WHERE season IN ({','.join([f"'{s}'" for s in seasons])})
         """
         
         try:
             result_df = self.query_data(processed_sql)
+            if result_df.empty:
+                return set()
+            # Snowflake returns column names in uppercase, normalize to lowercase
+            result_df.columns = result_df.columns.str.lower()
             return set(result_df['game_id'].tolist())
         except Exception as e:
             logger.warning(f"Could not get processed games: {e}")
+            # Return empty set if table doesn't exist or has no data
             return set()
+    
+    def get_processed_games_by_season(self, seasons: List[str]) -> Dict[str, set]:
+        """Get set of game IDs per season that have already been processed.
+        
+        Returns:
+            Dictionary mapping season to set of processed game IDs
+        """
+        processed_sql = f"""
+            SELECT DISTINCT season, game_id 
+            FROM GAME_METADATA 
+            WHERE season IN ({','.join([f"'{s}'" for s in seasons])})
+        """
+        
+        try:
+            result_df = self.query_data(processed_sql)
+            if result_df.empty:
+                return {season: set() for season in seasons}
+            
+            # Snowflake returns column names in uppercase by default, so normalize them
+            # Convert to lowercase for consistent access
+            result_df.columns = result_df.columns.str.lower()
+            
+            # Group by season
+            processed_by_season = {}
+            for season in seasons:
+                season_games = result_df[result_df['season'] == season]['game_id'].tolist()
+                processed_by_season[season] = set(season_games)
+            
+            # Ensure all seasons are in the dict
+            for season in seasons:
+                if season not in processed_by_season:
+                    processed_by_season[season] = set()
+            
+            return processed_by_season
+        except Exception as e:
+            logger.warning(f"Could not get processed games by season: {e}")
+            # Return empty sets for all seasons if query fails
+            return {season: set() for season in seasons}
     
     def close(self) -> None:
         """Close the database connection."""
