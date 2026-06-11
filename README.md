@@ -1,5 +1,12 @@
 # NBA Game Simulation Engine
 
+> **⚡ v2 pipeline available** — the [`v2/`](v2/README.md) package replaces this
+> legacy pipeline with a factorized, fully data-driven possession model:
+> rotation-anchored lineups, correct foul/usage attribution, learned rebounds,
+> pace, fatigue and substitutions, complete box scores (AST/STL/BLK), and a
+> calibration harness against real held-out games. Start there for new work;
+> everything below describes the legacy system.
+
 A sophisticated NBA game simulation system that uses machine learning to predict possession outcomes and simulates complete games with realistic player behaviors, fatigue systems, and substitution patterns.
 
 🚀 **Now with modern data engineering**: Snowflake integration, separate ETL pipelines, and cloud-ready architecture!

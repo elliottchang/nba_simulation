@@ -203,3 +203,7 @@ venv.bak/
 checkpoint.pkl
 feature_engineer.pkl
 
+
+# v2 pipeline data and artifacts
+data_v2/
+models_v2/
