@@ -84,6 +84,8 @@ class PossessionModelV2(nn.Module):
     def _ender_inputs(self, off, deff, ctx, slot):
         B = off.shape[0]
         ender = off[torch.arange(B, device=off.device), slot.clamp(min=0)]  # (B, D)
+        # rows without an attributed ball-ender use the lineup-mean token
+        ender = torch.where((slot >= 0).unsqueeze(-1), ender, off.mean(1))
         matchup, _ = self.matchup_attn(ender.unsqueeze(1), deff, deff)
         matchup = matchup.squeeze(1)
         return torch.cat([ender, matchup, off.mean(1), deff.mean(1), ctx], dim=-1)
@@ -117,10 +119,10 @@ class PossessionModelV2(nn.Module):
             losses["ender"] = F.cross_entropy(logits, batch["slot"][mask])
             metrics["ender_acc"] = (logits.argmax(-1) == batch["slot"][mask]).float().mean()
 
-        # action (only rows with a known ball-ender: the heads condition on him)
-        if mask.any():
-            logits = self.action_logits(off, deff, ctx, batch["slot"])[mask]
-            losses["action"] = F.cross_entropy(logits, batch["action"][mask])
+        # action: all rows (slot -1 rows are handled with a lineup-mean token,
+        # which keeps un-attributed drawn fouls in the action distribution)
+        logits = self.action_logits(off, deff, ctx, batch["slot"])
+        losses["action"] = F.cross_entropy(logits, batch["action"])
 
         # shot result
         smask = mask & (batch["shot"] >= 0)

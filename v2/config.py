@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data_v2"
 EVENTS_DIR = DATA_DIR / "events"          # per-season raw event parquet
-ROTATIONS_DIR = DATA_DIR / "rotations"    # per-season rotation parquet
+PLAYERS_DIR = DATA_DIR / "players"        # per-season game rosters/starters
 TABLES_DIR = DATA_DIR / "tables"          # derived training tables
 ARTIFACTS_DIR = ROOT / "models_v2"        # fitted model artifacts
 
@@ -39,19 +39,18 @@ FOUL_OUT_LIMIT = 6
 TEAM_FOULS_FOR_BONUS = 5          # 5th team foul of a period -> bonus FTs
 SHOT_CLOCK_SECONDS = 24
 
-# ---------------------------------------------------------------- NBA pbp codes
-EVT_MADE_SHOT = 1
-EVT_MISSED_SHOT = 2
-EVT_FREE_THROW = 3
-EVT_REBOUND = 4
-EVT_TURNOVER = 5
-EVT_FOUL = 6
-EVT_VIOLATION = 7
-EVT_SUBSTITUTION = 8
-EVT_TIMEOUT = 9
-EVT_JUMP_BALL = 10
-EVT_PERIOD_START = 12
-EVT_PERIOD_END = 13
+# ---------------------------------------------------------------- PlayByPlayV3 action types
+ACT_MADE = "Made Shot"
+ACT_MISSED = "Missed Shot"
+ACT_FT = "Free Throw"
+ACT_REBOUND = "Rebound"
+ACT_TURNOVER = "Turnover"
+ACT_FOUL = "Foul"
+ACT_SUB = "Substitution"
+ACT_TIMEOUT = "Timeout"
+ACT_JUMPBALL = "Jump Ball"
+ACT_PERIOD = "period"
+ACT_VIOLATION = "Violation"
 
 # ---------------------------------------------------------------- model hyperparameters
 STAT_DIM = 15              # per-player stat feature vector size (see features.py)

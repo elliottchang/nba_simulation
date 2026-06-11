@@ -1,13 +1,13 @@
-"""Event-level data collection with rotation-anchored lineups.
+"""Event-level data collection (PlayByPlayV3 + BoxScoreTraditionalV3).
 
-Fixes versus the legacy collector:
-  * Keeps ALL play-by-play events (rebounds, FTs, subs, timeouts), not just
-    possession-ending ones.
-  * Lineups come from the GameRotation endpoint (exact on-floor intervals),
-    so they cannot drift across period boundaries the way substitution
-    tracking does.
-  * No outcome parsing happens here; labeling lives in transform.py and can
-    be re-run without touching the network.
+The NBA retired PlayByPlayV2 and GameRotation (empty JSON as of 2025), so:
+  * events come from PlayByPlayV3 — structured shotValue/shotResult/subType,
+    adjacent STEAL/BLOCK rows with their own personId, scoreHome/scoreAway;
+  * game starters + rosters come from BoxScoreTraditionalV3 (position field);
+  * on-floor lineups are reconstructed offline in transform.py from
+    substitution rows with period-start inference.
+
+Two API calls per game. Checkpointed and resumable.
 
 Usage:
     python -m v2.collect                  # all seasons in config.SEASONS
@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import re
 import time
 from pathlib import Path
 
@@ -23,14 +24,14 @@ import pandas as pd
 
 from . import config
 
-EVENT_COLUMNS = [
-    "GAME_ID", "EVENTNUM", "EVENTMSGTYPE", "EVENTMSGACTIONTYPE", "PERIOD",
-    "PCTIMESTRING", "HOMEDESCRIPTION", "NEUTRALDESCRIPTION", "VISITORDESCRIPTION",
-    "SCORE", "SCOREMARGIN",
-    "PLAYER1_ID", "PLAYER1_NAME", "PLAYER1_TEAM_ID",
-    "PLAYER2_ID", "PLAYER2_NAME", "PLAYER2_TEAM_ID",
-    "PLAYER3_ID", "PLAYER3_NAME", "PLAYER3_TEAM_ID",
-]
+EVENT_COLUMNS = ["GAME_ID", "SEASON", "EVENTNUM", "ACTION_TYPE", "SUB_TYPE",
+                 "PERIOD", "ELAPSED", "TEAM_ID", "PERSON_ID", "SHOT_VALUE",
+                 "SHOT_RESULT", "SCORE_HOME", "SCORE_AWAY", "DESCRIPTION"]
+
+PLAYER_COLUMNS = ["GAME_ID", "SEASON", "TEAM_ID", "PERSON_ID", "NAME",
+                  "NAME_I", "FAMILY_NAME", "STARTER", "MINUTES"]
+
+_CLOCK_RE = re.compile(r"PT(\d+)M([\d.]+)S")
 
 
 def period_start_elapsed(period: int) -> float:
@@ -40,15 +41,28 @@ def period_start_elapsed(period: int) -> float:
     return reg + ot
 
 
-def clock_to_elapsed(period: int, clock_str: str) -> float:
-    """Convert (period, 'MM:SS' remaining) to total seconds elapsed."""
-    try:
-        m, s = str(clock_str).split(":")
-        remaining = int(m) * 60 + int(s)
-    except (ValueError, AttributeError):
-        remaining = 0
+def parse_clock(clock: str) -> float:
+    """'PT11M38.00S' -> seconds remaining in period."""
+    m = _CLOCK_RE.match(str(clock))
+    if not m:
+        return 0.0
+    return int(m.group(1)) * 60 + float(m.group(2))
+
+
+def clock_to_elapsed(period: int, clock: str) -> float:
     length = config.PERIOD_SECONDS if period <= config.REGULATION_PERIODS else config.OT_SECONDS
-    return period_start_elapsed(period) + (length - remaining)
+    return period_start_elapsed(period) + (length - parse_clock(clock))
+
+
+def minutes_to_float(v) -> float:
+    s = str(v)
+    if ":" in s:
+        m, sec = s.split(":")
+        try:
+            return float(m) + float(sec) / 60.0
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 def retry(func, max_retries: int = 3, base_delay: float = 2.0):
@@ -62,22 +76,17 @@ def retry(func, max_retries: int = 3, base_delay: float = 2.0):
 
 
 class EventCollector:
-    """Collects raw events + rotations for a set of seasons, with checkpointing."""
-
     def __init__(self, seasons=None, request_delay: float = 0.8):
         self.seasons = seasons or config.SEASONS
         self.request_delay = request_delay
         config.EVENTS_DIR.mkdir(parents=True, exist_ok=True)
-        config.ROTATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        config.PLAYERS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------ helpers
     @staticmethod
     def _season_paths(season: str):
         tag = season.replace("-", "_")
-        return (
-            config.EVENTS_DIR / f"events_{tag}.parquet",
-            config.ROTATIONS_DIR / f"rotations_{tag}.parquet",
-        )
+        return (config.EVENTS_DIR / f"events_{tag}.parquet",
+                config.PLAYERS_DIR / f"players_{tag}.parquet")
 
     @staticmethod
     def _done_game_ids(path: Path) -> set:
@@ -86,7 +95,6 @@ class EventCollector:
         return set()
 
     def list_game_ids(self, season: str) -> list:
-        """Regular-season game ids for a season, oldest first."""
         from nba_api.stats.endpoints import leaguegamefinder
 
         games = retry(lambda: leaguegamefinder.LeagueGameFinder(
@@ -94,70 +102,87 @@ class EventCollector:
             season_type_nullable="Regular Season",
             league_id_nullable="00",
         ).get_data_frames()[0])
-        ids = sorted(games["GAME_ID"].unique())
-        return ids
+        return sorted(games["GAME_ID"].unique())
 
-    def fetch_game(self, game_id: str):
-        """Return (events_df, rotation_df) for one game, or None on failure."""
-        from nba_api.stats.endpoints import gamerotation, playbyplayv2
+    def fetch_game(self, game_id: str, season: str):
+        """Returns (events_df, players_df) or None."""
+        from nba_api.stats.endpoints import boxscoretraditionalv3, playbyplayv3
 
         time.sleep(self.request_delay)
-        events = retry(lambda: playbyplayv2.PlayByPlayV2(
+        pbp = retry(lambda: playbyplayv3.PlayByPlayV3(
             game_id=game_id, timeout=60).get_data_frames()[0])
-        if events.empty:
+        if pbp.empty:
             return None
 
         time.sleep(self.request_delay)
-        rot_frames = retry(lambda: gamerotation.GameRotation(
-            game_id=game_id, timeout=60).get_data_frames())
-        rotation = pd.concat(rot_frames, ignore_index=True)
-        if rotation.empty:
+        box = retry(lambda: boxscoretraditionalv3.BoxScoreTraditionalV3(
+            game_id=game_id, timeout=60).get_data_frames()[0])
+        if box.empty:
             return None
 
-        events = events.reindex(columns=EVENT_COLUMNS)
-        events["GAME_ID"] = game_id
-        events["ELAPSED"] = [
-            clock_to_elapsed(p, c) for p, c in zip(events["PERIOD"], events["PCTIMESTRING"])
-        ]
+        events = pd.DataFrame({
+            "GAME_ID": game_id,
+            "SEASON": season,
+            "EVENTNUM": pbp["actionNumber"],
+            "ACTION_TYPE": pbp["actionType"].fillna(""),
+            "SUB_TYPE": pbp["subType"].fillna(""),
+            "PERIOD": pbp["period"].astype(int),
+            "ELAPSED": [clock_to_elapsed(p, c)
+                        for p, c in zip(pbp["period"], pbp["clock"])],
+            "TEAM_ID": pd.to_numeric(pbp["teamId"], errors="coerce").fillna(0).astype(np.int64),
+            "PERSON_ID": pd.to_numeric(pbp["personId"], errors="coerce").fillna(0).astype(np.int64),
+            "SHOT_VALUE": pd.to_numeric(pbp["shotValue"], errors="coerce").fillna(0).astype(int),
+            "SHOT_RESULT": pbp["shotResult"].fillna(""),
+            "SCORE_HOME": pd.to_numeric(pbp["scoreHome"], errors="coerce").fillna(0).astype(int),
+            "SCORE_AWAY": pd.to_numeric(pbp["scoreAway"], errors="coerce").fillna(0).astype(int),
+            "DESCRIPTION": pbp["description"].fillna(""),
+        })
 
-        # GameRotation reports IN/OUT in tenths of a second of game time.
-        rotation = rotation.rename(columns=str.upper)
-        keep = ["GAME_ID", "TEAM_ID", "PERSON_ID", "IN_TIME_REAL", "OUT_TIME_REAL"]
-        rotation = rotation[keep].copy()
-        rotation["IN_SEC"] = rotation["IN_TIME_REAL"] / 10.0
-        rotation["OUT_SEC"] = rotation["OUT_TIME_REAL"] / 10.0
-        rotation["GAME_ID"] = game_id
-        return events, rotation
+        players = pd.DataFrame({
+            "GAME_ID": game_id,
+            "SEASON": season,
+            "TEAM_ID": box["teamId"].astype(np.int64),
+            "PERSON_ID": box["personId"].astype(np.int64),
+            "NAME": box["firstName"].fillna("") + " " + box["familyName"].fillna(""),
+            "NAME_I": box["nameI"].fillna(""),
+            "FAMILY_NAME": box["familyName"].fillna(""),
+            "STARTER": (box["position"].fillna("") != "").astype(int),
+            "MINUTES": box["minutes"].fillna("").map(minutes_to_float),
+        })
+        if players["STARTER"].sum() != 10:
+            # fall back to top-5 minutes per team
+            players["STARTER"] = 0
+            for tid, grp in players.groupby("TEAM_ID"):
+                top5 = grp.nlargest(5, "MINUTES").index
+                players.loc[top5, "STARTER"] = 1
+        return events, players
 
-    # ------------------------------------------------------------ main loop
     def collect_season(self, season: str, max_games: int = None):
-        events_path, rot_path = self._season_paths(season)
+        events_path, players_path = self._season_paths(season)
         done = self._done_game_ids(events_path)
         game_ids = [g for g in self.list_game_ids(season) if g not in done]
         if max_games is not None:
             game_ids = game_ids[:max_games]
         print(f"[{season}] {len(done)} games already collected, {len(game_ids)} to go")
 
-        events_buf, rot_buf = [], []
+        events_buf, players_buf = [], []
         for i, game_id in enumerate(game_ids, 1):
             try:
-                result = self.fetch_game(game_id)
+                result = self.fetch_game(game_id, season)
             except Exception as e:
                 print(f"  {game_id}: failed after retries ({str(e)[:80]})")
                 continue
             if result is None:
                 print(f"  {game_id}: empty data, skipped")
                 continue
-            ev, rot = result
-            ev["SEASON"] = season
-            rot["SEASON"] = season
+            ev, pl = result
             events_buf.append(ev)
-            rot_buf.append(rot)
+            players_buf.append(pl)
 
             if i % 25 == 0 or i == len(game_ids):
                 self._flush(events_buf, events_path)
-                self._flush(rot_buf, rot_path)
-                events_buf, rot_buf = [], []
+                self._flush(players_buf, players_path)
+                events_buf, players_buf = [], []
                 print(f"  [{season}] {i}/{len(game_ids)} games collected")
 
     @staticmethod
@@ -179,7 +204,6 @@ def main():
     parser.add_argument("--season", default=None, help="single season, e.g. 2023-24")
     parser.add_argument("--max-games", type=int, default=None)
     args = parser.parse_args()
-
     seasons = [args.season] if args.season else None
     EventCollector(seasons=seasons).collect_all(max_games=args.max_games)
 

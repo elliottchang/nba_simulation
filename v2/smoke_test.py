@@ -33,55 +33,56 @@ config.MODEL_FILE = _TMP / "artifacts/possession_model_v2.pt"
 config.DURATION_FILE = _TMP / "artifacts/duration_model.pkl"
 config.SUB_MODEL_FILE = _TMP / "artifacts/substitution_model.pkl"
 
-from .collect import EVENT_COLUMNS  # noqa: E402
 from .transform import GameTransformer  # noqa: E402
 
 HOME, AWAY = 1610612700, 1610612799
-HOME_PLAYERS = [1, 2, 3, 4, 5]
-AWAY_PLAYERS = [11, 12, 13, 14, 15]
+HOME_PLAYERS = {1: "Smith", 2: "Jones", 3: "Brown", 4: "Lee", 5: "Park"}
+AWAY_PLAYERS = {11: "Doe", 12: "Roe", 13: "Poe", 14: "Moe", 15: "Joe"}
 
 
-def _event(num, etype, atype, elapsed, p1=None, p1_team=None, p2=None,
-           p2_team=None, p3=None, p3_team=None, home_desc=None, vis_desc=None):
-    row = dict.fromkeys(EVENT_COLUMNS)
-    row.update({
-        "GAME_ID": "SMOKE01", "EVENTNUM": num, "EVENTMSGTYPE": etype,
-        "EVENTMSGACTIONTYPE": atype, "PERIOD": 1, "PCTIMESTRING": "10:00",
-        "HOMEDESCRIPTION": home_desc, "VISITORDESCRIPTION": vis_desc,
-        "PLAYER1_ID": p1, "PLAYER1_TEAM_ID": p1_team,
-        "PLAYER2_ID": p2, "PLAYER2_TEAM_ID": p2_team,
-        "PLAYER3_ID": p3, "PLAYER3_TEAM_ID": p3_team,
-    })
-    row["ELAPSED"] = elapsed
-    return row
+def _event(num, action_type, sub_type, elapsed, team=0, pid=0, shot_value=0,
+           desc="", score_home=0, score_away=0):
+    return {
+        "GAME_ID": "SMOKE01", "SEASON": "2023-24", "EVENTNUM": num,
+        "ACTION_TYPE": action_type, "SUB_TYPE": sub_type, "PERIOD": 1,
+        "ELAPSED": elapsed, "TEAM_ID": team, "PERSON_ID": pid,
+        "SHOT_VALUE": shot_value, "SHOT_RESULT": "",
+        "SCORE_HOME": score_home, "SCORE_AWAY": score_away,
+        "DESCRIPTION": desc,
+    }
 
 
 def test_transform_attribution():
     events = pd.DataFrame([
         # assisted home 2pt make
-        _event(1, 1, 1, 10.0, p1=1, p1_team=HOME, p2=2, p2_team=HOME,
-               home_desc="Smith 18' Jump Shot (2 PTS) (Jones 1 AST)"),
+        _event(1, "Made Shot", "Jump Shot", 10.0, team=HOME, pid=1, shot_value=2,
+               desc="Smith 18' Jump Shot (2 PTS) (Jones 1 AST)",
+               score_home=2, score_away=0),
         # shooting foul BY home player 3 ON away player 11 -> 2 FTs (1/2) -> home dreb
-        _event(2, 6, 2, 30.0, p1=3, p1_team=HOME, p2=11, p2_team=AWAY,
-               home_desc="Smith S.FOUL (P1.T1)"),
-        _event(3, 3, 11, 31.0, p1=11, p1_team=AWAY, vis_desc="Doe Free Throw 1 of 2"),
-        _event(4, 3, 12, 32.0, p1=11, p1_team=AWAY, vis_desc="MISS Doe Free Throw 2 of 2"),
-        _event(5, 4, 0, 33.0, p1=4, p1_team=HOME, home_desc="Brown REBOUND"),
-        # away turnover, stolen by home player 5
-        _event(6, 5, 1, 50.0, p1=12, p1_team=AWAY, p2=5, p2_team=HOME,
-               vis_desc="Roe Bad Pass Turnover", home_desc="Lee STEAL"),
+        _event(2, "Foul", "Shooting", 30.0, team=HOME, pid=3,
+               desc="Brown S.FOUL (P1.T1) (R.Doe)"),
+        _event(3, "Free Throw", "Free Throw 1 of 2", 31.0, team=AWAY, pid=11,
+               desc="Doe Free Throw 1 of 2", score_home=2, score_away=1),
+        _event(4, "Free Throw", "Free Throw 2 of 2", 32.0, team=AWAY, pid=11,
+               desc="MISS Doe Free Throw 2 of 2"),
+        _event(5, "Rebound", "", 33.0, team=HOME, pid=4, desc="Lee REBOUND"),
+        # away turnover, stolen by home player 5 (adjacent blank-actionType row)
+        _event(6, "Turnover", "Bad Pass", 50.0, team=AWAY, pid=12,
+               desc="Roe Bad Pass Turnover (P1.T2)"),
+        _event(7, "", "", 50.0, team=HOME, pid=5, desc="Park STEAL (1 STL)"),
         # home missed 3, offensive rebound by home player 1
-        _event(7, 2, 1, 70.0, p1=2, p1_team=HOME,
-               home_desc="MISS Jones 26' 3PT Jump Shot"),
-        _event(8, 4, 0, 71.0, p1=1, p1_team=HOME, home_desc="Smith REBOUND"),
+        _event(8, "Missed Shot", "Jump Shot", 70.0, team=HOME, pid=2, shot_value=3,
+               desc="MISS Jones 26' 3PT Jump Shot"),
+        _event(9, "Rebound", "", 71.0, team=HOME, pid=1, desc="Smith REBOUND"),
     ])
-    rotation = pd.DataFrame(
-        [{"GAME_ID": "SMOKE01", "TEAM_ID": t, "PERSON_ID": p,
-          "IN_TIME_REAL": 0.0, "OUT_TIME_REAL": 28800.0,
-          "IN_SEC": 0.0, "OUT_SEC": 2880.0}
-         for t, ps in ((HOME, HOME_PLAYERS), (AWAY, AWAY_PLAYERS)) for p in ps])
+    players = pd.DataFrame(
+        [{"GAME_ID": "SMOKE01", "SEASON": "2023-24", "TEAM_ID": t,
+          "PERSON_ID": p, "NAME": f"X {fam}", "NAME_I": f"{'R' if t == AWAY else 'X'}. {fam}",
+          "FAMILY_NAME": fam, "STARTER": 1, "MINUTES": 24.0}
+         for t, roster in ((HOME, HOME_PLAYERS), (AWAY, AWAY_PLAYERS))
+         for p, fam in roster.items()])
 
-    result = GameTransformer("SMOKE01", "2023-24", events, rotation).run()
+    result = GameTransformer("SMOKE01", "2023-24", events, players).run()
     ch = pd.DataFrame(result["chances"])
 
     assert len(ch) == 4, f"expected 4 chances, got {len(ch)}"

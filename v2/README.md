@@ -9,8 +9,8 @@ model/attribution with fitted components at every stage.
 |---|---|
 | Outcome sampled at lineup level, player attributed by (broken) usage lottery | Factorized model: P(ball-ender) → P(action \| ball-ender) → P(result \| shot, defense) — stats follow from who actually did what |
 | `usage_rate` always 1.0 | Usage = ended chances ÷ team chances while on floor, EB-shrunk |
-| Lineups tracked from sub events (drift across quarters, ~60% of possessions lost) | Exact on-floor intervals from the GameRotation endpoint |
-| Shooting/defensive fouls attributed to the defender (wrong team's lineups) | Fouled player (PLAYER2) is the ball-ender; defender only charged the foul |
+| Lineups tracked from sub events (drift across quarters, ~60% of possessions lost) | Substitution tracking + period-start inference + self-healing anchors (pilot: 236 chances/game, 0.8% skipped) |
+| Shooting/defensive fouls attributed to the defender (wrong team's lineups) | Fouled player is the ball-ender, identified by who shoots the ensuing FTs; defender only charged the foul |
 | Hardcoded rebound rates, uniform rebounder | Learned OREB head + rebounder head over real rebounds |
 | Energy meter with invented thresholds | Stint/cumulative-minutes features in the model, fitted on real data |
 | Rule-based substitutions gated by a `deadball` flag that never reset | Logistic exit policy fitted on real (deadball × player) coach decisions |
@@ -21,6 +21,25 @@ model/attribution with fitted components at every stage.
 | Mean-pooled embeddings, per-player-season vocab | Stat-anchored tokens + cross-season player embeddings + cross-attention matchup layer |
 | Random-row train/val split (leaks) | Game-level split, marginal baseline reported |
 | No realism measurement | `calibrate.py` backtests simulated vs. held-out real games |
+
+> **API note (June 2026):** the NBA retired `PlayByPlayV2` and `GameRotation`
+> (both return empty JSON), which also broke the legacy collector. v2 uses
+> `PlayByPlayV3` + `BoxScoreTraditionalV3` — two calls per game. V3 foul
+> descriptions name the *referee*, not the fouled player, so fouled-player
+> attribution goes through the ensuing free-throw shooter; non-bonus drawn
+> fouls (no FTs) are kept at lineup level (`ball_ender = -1`) and handled
+> with a lineup-mean token in the action head.
+
+## Pilot validation (20 real 2024-25 games)
+
+Extraction quality, measured before committing to full collection:
+accumulated scores match the official play-by-play exactly in 19/20 games;
+236 chances/game (legacy: 89) with 0.8% skipped; steal capture 367/369 vs
+official; FG% 45.5 / 3PA share 40.4% / OREB 24.0% / FT% 80.3 / assisted-on-
+make 61.7% — all consistent with NBA rates. Training and the calibration
+loop run end to end on this pilot; expect simulated quality to be poor until
+full seasons are collected (embeddings and the substitution policy are
+data-hungry).
 
 ## Workflow
 

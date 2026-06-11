@@ -1,147 +1,254 @@
-﻿"""Transform raw events + rotations into model-ready training tables.
+"""Transform raw V3 events + game rosters into model-ready training tables.
 
-Outputs (all under data_v2/tables/):
-  chances.parquet       one row per scoring chance, with correct attribution:
-                          - ball-ender chosen from the event that defines the
-                            chance (shooter / turnover committer / FOULED
-                            player on defensive fouls -- PLAYER2, never the
-                            defender)
-                          - offense-perspective score margin from accumulated
-                            scores (not the home-perspective SCOREMARGIN string)
-                          - lineups from rotation intervals (no drift)
-                          - linked rebound outcome for misses
-                          - ball-ender stint/cumulative minutes (fatigue signal)
-  free_throws.parquet   one row per FT attempt (shooter, made)
-  sub_decisions.parquet (deadball moment x on-court player) -> exited or not
-  games.parquet         per-game metadata + final scores for calibration
+Attribution rules (all fixes vs. legacy):
+  * ball-ender = shooter / turnover committer / FOULED player on defensive
+    fouls (parsed from the foul description, resolved against the opposing
+    roster) — never the defender
+  * offense-perspective score margin from accumulated scores
+  * lineups reconstructed from substitution rows with period-start
+    inference; chances whose lineups can't be established are skipped and
+    counted (the skip rate is a data-quality metric, printed at the end)
+  * misses linked to their rebound; assists/steals/blocks from the
+    structured adjacent rows
+  * per-lineup stint/cumulative-minutes features for fatigue learning
 
-Re-runnable without network access whenever labeling logic changes.
+Outputs (data_v2/tables/): chances, free_throws, sub_decisions, games.
+Re-runnable offline whenever labeling logic changes.
 """
 
-import pickle
 import random
+import re
 from collections import defaultdict
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from . import config
 from .config import (
-    EVT_MADE_SHOT, EVT_MISSED_SHOT, EVT_FREE_THROW, EVT_REBOUND,
-    EVT_TURNOVER, EVT_FOUL, EVT_TIMEOUT, EVT_PERIOD_END,
+    ACT_MADE, ACT_MISSED, ACT_FT, ACT_REBOUND, ACT_TURNOVER, ACT_FOUL,
+    ACT_SUB, ACT_TIMEOUT, ACT_PERIOD,
 )
+from .collect import period_start_elapsed
 
-# Foul EVENTMSGACTIONTYPEs (NBA pbp)
-FOUL_SHOOTING = {2, 9, 29}          # shooting, shooting-block, shooting away-from-play
-FOUL_OFFENSIVE = {4, 26}            # offensive, charge
-FOUL_TECHNICAL = {11, 12, 13, 18, 19, 25, 30}
+MADE_SHOT_DEADBALL_SAMPLE = 0.3   # sub-decision sampling rate at made-shot deadballs
 
-MADE_SHOT_DEADBALL_SAMPLE = 0.3     # sub-decision sampling rate at made-shot deadballs
-TEAM_ID_FLOOR = 1_600_000_000       # PLAYER*_ID values >= this are team ids
+CHANCE_ENDERS = {ACT_MADE, ACT_MISSED, ACT_TURNOVER, ACT_FOUL}
+PRESENCE_ACTIONS = {ACT_MADE, ACT_MISSED, ACT_FT, ACT_REBOUND, ACT_TURNOVER,
+                    ACT_FOUL, ACT_SUB, "Jump Ball", ""}
 
-
-def is_player_id(v) -> bool:
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return False
-    return 0 < v < TEAM_ID_FLOOR
+_SUB_RE = re.compile(r"SUB:\s*(.+?)\s+FOR\s+(.+)$", re.IGNORECASE)
+_AST_RE = re.compile(r"\(([\w .'-]+?)\s+\d+\s+AST\)")
+_INITIAL_RE = re.compile(r"^([A-Z])\.\s*(.+)$")
 
 
-def is_team_id(v) -> bool:
-    try:
-        v = int(v)
-    except (TypeError, ValueError):
-        return False
-    return v >= TEAM_ID_FLOOR
+def norm_name(s: str) -> str:
+    return re.sub(r"[\s.]", "", str(s)).lower()
 
 
-def event_desc(row) -> str:
-    parts = [row.get("HOMEDESCRIPTION"), row.get("NEUTRALDESCRIPTION"), row.get("VISITORDESCRIPTION")]
-    return " ".join(str(p) for p in parts if pd.notna(p)).upper()
+class GameRoster:
+    """Name-resolution and starter info for one game from the boxscore."""
+
+    def __init__(self, players_df: pd.DataFrame):
+        self.team_ids = sorted(players_df["TEAM_ID"].unique().tolist())
+        self.players = defaultdict(set)        # team -> pids
+        self.starters = defaultdict(set)
+        self.by_family = defaultdict(list)     # (team, norm family) -> [pids]
+        self.by_initial = defaultdict(list)    # (team, norm nameI) -> [pids]
+        for r in players_df.itertuples():
+            t, p = int(r.TEAM_ID), int(r.PERSON_ID)
+            self.players[t].add(p)
+            if r.STARTER:
+                self.starters[t].add(p)
+            self.by_family[(t, norm_name(r.FAMILY_NAME))].append(p)
+            self.by_initial[(t, norm_name(r.NAME_I))].append(p)
+
+    def other(self, team_id: int) -> int:
+        return self.team_ids[1] if team_id == self.team_ids[0] else self.team_ids[0]
+
+    def resolve_family(self, team_id: int, name: str, prefer_not_in: set = None) -> int:
+        """Resolve 'Wagner', 'Nance Jr.' or initial-disambiguated 'M. Wagner'."""
+        cands = self.by_family.get((int(team_id), norm_name(name)), [])
+        if not cands:
+            m = _INITIAL_RE.match(str(name).strip())
+            if m:
+                cands = self.by_initial.get(
+                    (int(team_id), norm_name(f"{m.group(1)}.{m.group(2)}")), [])
+        if prefer_not_in and len(cands) > 1:
+            filtered = [c for c in cands if c not in prefer_not_in]
+            if filtered:
+                cands = filtered
+        return cands[0] if cands else None
 
 
-def is_3pt(row) -> bool:
-    return "3PT" in event_desc(row)
+class LineupTracker:
+    """Reconstructs on-floor intervals from substitution rows.
 
+    Q1 starts from boxscore starters; later periods are inferred: a player
+    is on at period start if he registers any event before being subbed IN
+    during that period; gaps are filled by carry-over from the previous
+    period's closing lineup.
+    """
 
-class RotationIndex:
-    """Fast on-floor lookups from GameRotation intervals for one game."""
+    def __init__(self, events: pd.DataFrame, roster: GameRoster):
+        self.events = events
+        self.roster = roster
+        self.intervals = defaultdict(list)     # (team, pid) -> [(in, out)]
+        self.fill_periods = 0                  # diagnostics
+        self._build()
 
-    def __init__(self, rot_df: pd.DataFrame):
-        self.intervals = defaultdict(list)   # (team_id, player_id) -> [(in, out)]
-        self.team_players = defaultdict(set)
-        for r in rot_df.itertuples():
-            key = (int(r.TEAM_ID), int(r.PERSON_ID))
-            self.intervals[key].append((float(r.IN_SEC), float(r.OUT_SEC)))
-            self.team_players[int(r.TEAM_ID)].add(int(r.PERSON_ID))
-        self.team_ids = sorted(self.team_players.keys())
+    def _parse_sub(self, row):
+        m = _SUB_RE.match(str(row.DESCRIPTION))
+        if not m:
+            return None, None
+        team = int(row.TEAM_ID)
+        out_pid = int(row.PERSON_ID)
+        in_pid = self.roster.resolve_family(team, m.group(1))
+        return out_pid, in_pid
 
-    def on_floor(self, team_id: int, t: float) -> list:
-        out = []
-        for pid in self.team_players[team_id]:
-            for lo, hi in self.intervals[(team_id, pid)]:
-                if lo <= t < hi:
-                    out.append(pid)
+    def _infer_period_starters(self, period_events, team: int, carry: set) -> set:
+        evidence, subbed_in = set(), set()
+        for r in period_events.itertuples():
+            if int(r.TEAM_ID) != team:
+                continue
+            if r.ACTION_TYPE == ACT_SUB:
+                out_pid, in_pid = self._parse_sub(r)
+                if out_pid and out_pid not in subbed_in:
+                    evidence.add(out_pid)
+                if in_pid:
+                    subbed_in.add(in_pid)
+            elif r.ACTION_TYPE in PRESENCE_ACTIONS:
+                pid = int(r.PERSON_ID)
+                if pid > 0 and pid in self.roster.players[team] and pid not in subbed_in:
+                    evidence.add(pid)
+        starters = set(list(evidence)[:5])
+        if len(starters) < 5:
+            self.fill_periods += 1
+            for pid in carry:
+                if len(starters) == 5:
                     break
+                if pid not in subbed_in and pid not in starters:
+                    starters.add(pid)
+        return starters
+
+    def _build(self):
+        ev = self.events
+        periods = sorted(ev["PERIOD"].unique())
+        game_end = float(ev["ELAPSED"].max())
+        on_floor = {t: set() for t in self.roster.team_ids}
+        entry = {}
+
+        def come_on(team, pid, t):
+            if pid not in on_floor[team]:
+                on_floor[team].add(pid)
+                entry[(team, pid)] = t
+
+        def go_off(team, pid, t):
+            if pid in on_floor[team]:
+                on_floor[team].discard(pid)
+                t0 = entry.pop((team, pid), t)
+                if t > t0:
+                    self.intervals[(team, pid)].append((t0, t))
+
+        for period in periods:
+            pstart = period_start_elapsed(int(period))
+            pev = ev[ev["PERIOD"] == period]
+            for team in self.roster.team_ids:
+                if period == 1:
+                    starters = set(self.roster.starters[team]) or set(
+                        list(self.roster.players[team])[:5])
+                else:
+                    starters = self._infer_period_starters(pev, team, on_floor[team])
+                for pid in list(on_floor[team]):
+                    if pid not in starters:
+                        go_off(team, pid, pstart)
+                for pid in starters:
+                    come_on(team, pid, pstart)
+            for r in pev.itertuples():
+                if r.ACTION_TYPE == ACT_SUB:
+                    team = int(r.TEAM_ID)
+                    out_pid, in_pid = self._parse_sub(r)
+                    if out_pid:
+                        go_off(team, out_pid, float(r.ELAPSED))
+                    if in_pid:
+                        come_on(team, in_pid, float(r.ELAPSED))
+                elif r.ACTION_TYPE in PRESENCE_ACTIONS:
+                    # self-heal: an actor we lost track of is evidently on the
+                    # floor — re-anchor him if there is room
+                    team, pid = int(r.TEAM_ID), int(r.PERSON_ID)
+                    if (pid > 0 and pid in self.roster.players.get(team, ())
+                            and pid not in on_floor[team]
+                            and len(on_floor[team]) < 5):
+                        come_on(team, pid, float(r.ELAPSED))
+        for team in self.roster.team_ids:
+            for pid in list(on_floor[team]):
+                go_off(team, pid, game_end)
+
+    # ----- same query interface the transformer used with GameRotation data
+    def on_floor_at(self, team_id: int, t: float) -> list:
+        out = []
+        for (team, pid), spans in self.intervals.items():
+            if team != team_id:
+                continue
+            if any(lo <= t < hi for lo, hi in spans):
+                out.append(pid)
         return sorted(out)
 
     def lineup_at(self, team_id: int, t: float, must_include: int = None) -> list:
-        """5-man lineup at time t; nudges t if it lands on a sub boundary."""
         for probe in (t, t - 0.5, t + 0.5):
-            lineup = self.on_floor(team_id, probe)
+            lineup = self.on_floor_at(team_id, probe)
             if len(lineup) == 5 and (must_include is None or must_include in lineup):
                 return lineup
-        lineup = self.on_floor(team_id, t)
+        lineup = self.on_floor_at(team_id, t)
         return lineup if len(lineup) == 5 else None
 
     def stint_features(self, team_id: int, player_id: int, t: float):
-        """(seconds into current stint, cumulative seconds played) at time t."""
         stint, cum = 0.0, 0.0
-        for lo, hi in self.intervals[(team_id, player_id)]:
+        for lo, hi in self.intervals.get((team_id, player_id), []):
             if lo <= t:
                 cum += min(hi, t) - lo
                 if t < hi:
                     stint = t - lo
         return stint, cum
 
-    def starters(self, team_id: int) -> set:
-        return {pid for pid in self.team_players[team_id]
-                if any(lo == 0.0 for lo, _ in self.intervals[(team_id, pid)])}
-
 
 def infer_home_team(events: pd.DataFrame, team_ids: list) -> int:
-    """Home team = team whose shots appear in HOMEDESCRIPTION."""
-    shots = events[events["EVENTMSGTYPE"].isin([EVT_MADE_SHOT, EVT_MISSED_SHOT])]
+    """Home team = team whose made shots move SCORE_HOME."""
     votes = defaultdict(int)
-    for r in shots.itertuples():
-        if pd.notna(r.HOMEDESCRIPTION) and is_team_id(r.PLAYER1_TEAM_ID):
-            votes[int(r.PLAYER1_TEAM_ID)] += 1
-        elif pd.notna(r.VISITORDESCRIPTION) and is_team_id(r.PLAYER1_TEAM_ID):
-            votes[int(r.PLAYER1_TEAM_ID)] -= 1
+    last_h = last_a = 0
+    scoring = events[(events["SCORE_HOME"] > 0) | (events["SCORE_AWAY"] > 0)]
+    for r in scoring.itertuples():
+        h, a = int(r.SCORE_HOME), int(r.SCORE_AWAY)
+        team = int(r.TEAM_ID)
+        if team > 0:
+            if h > last_h and a == last_a:
+                votes[team] += 1
+            elif a > last_a and h == last_h:
+                votes[team] -= 1
+        last_h, last_a = h, a
     if not votes:
         return team_ids[0]
     return max(votes, key=votes.get)
 
 
 class GameTransformer:
-    """Walks one game's events and emits training rows."""
+    """Walks one game's canonical V3 events and emits training rows."""
 
-    def __init__(self, game_id, season, events, rotation):
+    def __init__(self, game_id, season, events, players_df):
         self.game_id = game_id
         self.season = season
         self.events = events.sort_values("EVENTNUM").reset_index(drop=True)
-        self.rot = RotationIndex(rotation)
-        if len(self.rot.team_ids) != 2:
-            raise ValueError("expected exactly 2 teams in rotation data")
-        self.home_team = infer_home_team(self.events, self.rot.team_ids)
-        self.away_team = [t for t in self.rot.team_ids if t != self.home_team][0]
+        self.roster = GameRoster(players_df)
+        if len(self.roster.team_ids) != 2:
+            raise ValueError("expected exactly 2 teams in boxscore data")
+        self.tracker = LineupTracker(self.events, self.roster)
+        self.home_team = infer_home_team(self.events, self.roster.team_ids)
+        self.away_team = self.roster.other(self.home_team)
 
         self.scores = {self.home_team: 0, self.away_team: 0}
-        self.team_fouls_period = defaultdict(int)   # (team, period) -> fouls
+        self.team_fouls_period = defaultdict(int)
         self.player_fouls = defaultdict(int)
-        self.chance_start = 0.0                      # elapsed secs when current chance began
+        self.chance_start = 0.0
+        self.consumed_ft = set()      # row indices already absorbed by a foul
 
         self.chances, self.fts, self.sub_rows = [], [], []
         self.skipped = 0
@@ -154,56 +261,83 @@ class GameTransformer:
         return self.scores[offense_team] - self.scores[self.other(offense_team)]
 
     def period_seconds_remaining(self, period: int, elapsed: float) -> float:
-        length = config.PERIOD_SECONDS if period <= config.REGULATION_PERIODS else config.OT_SECONDS
-        from .collect import period_start_elapsed
+        length = (config.PERIOD_SECONDS if period <= config.REGULATION_PERIODS
+                  else config.OT_SECONDS)
         return max(0.0, period_start_elapsed(period) + length - elapsed)
 
     def _ft_run(self, start_idx: int, shooter: int):
-        """Consecutive FT events by `shooter` starting at start_idx. Returns (n, made, last_missed, end_idx)."""
+        """Consecutive FTs by `shooter`. Returns (n, made, last_missed, end_idx)."""
         n = made = 0
         last_missed = False
         i = start_idx
         while i < len(self.events):
             row = self.events.iloc[i]
-            if row["EVENTMSGTYPE"] != EVT_FREE_THROW or not is_player_id(row["PLAYER1_ID"]) \
-                    or int(row["PLAYER1_ID"]) != shooter:
-                # allow interleaved subs/timeouts inside a FT sequence
-                if row["EVENTMSGTYPE"] in (EVT_FREE_THROW, EVT_MADE_SHOT, EVT_MISSED_SHOT,
-                                           EVT_TURNOVER, EVT_REBOUND, EVT_PERIOD_END):
-                    break
+            at = row["ACTION_TYPE"]
+            if at == ACT_FT and int(row["PERSON_ID"]) == shooter:
+                n += 1
+                self.consumed_ft.add(i)
+                missed = str(row["DESCRIPTION"]).upper().startswith("MISS")
+                last_missed = missed
+                if not missed:
+                    made += 1
+                    self.scores[int(row["TEAM_ID"])] += 1
+                self.fts.append({"game_id": self.game_id, "season": self.season,
+                                 "player_id": shooter, "made": int(not missed)})
                 i += 1
-                continue
-            n += 1
-            missed = "MISS" in event_desc(row)
-            last_missed = missed
-            if not missed:
-                made += 1
-                self.scores[int(row["PLAYER1_TEAM_ID"])] += 1
-            self.fts.append({
-                "game_id": self.game_id, "season": self.season,
-                "player_id": shooter, "made": int(not missed),
-            })
-            i += 1
+            elif at in ("", ACT_SUB, ACT_TIMEOUT):   # interleaved non-action rows
+                i += 1
+            else:
+                break
         return n, made, last_missed, i
 
     def _find_rebound(self, start_idx: int):
-        """Next rebound event at/after start_idx (skipping non-action rows)."""
         for i in range(start_idx, min(start_idx + 6, len(self.events))):
             row = self.events.iloc[i]
-            if row["EVENTMSGTYPE"] == EVT_REBOUND:
-                team = row["PLAYER1_TEAM_ID"]
-                pid = row["PLAYER1_ID"]
-                if is_player_id(pid) and is_team_id(team):
-                    return int(team), int(pid)
-                # team rebound: PLAYER1_ID holds the team id
-                if is_team_id(pid):
-                    return int(pid), None
-                if is_team_id(team):
-                    return int(team), None
-            if row["EVENTMSGTYPE"] in (EVT_MADE_SHOT, EVT_MISSED_SHOT, EVT_TURNOVER,
-                                       EVT_FOUL, EVT_PERIOD_END):
+            at = row["ACTION_TYPE"]
+            if at == ACT_REBOUND:
+                team = int(row["TEAM_ID"])
+                pid = int(row["PERSON_ID"])
+                if team > 0:
+                    return team, (pid if pid > 0 else None)
+            if at in CHANCE_ENDERS or (at == ACT_PERIOD and row["SUB_TYPE"] == "end"):
                 break
         return None, None
+
+    def _adjacent_marker(self, idx: int, marker: str):
+        """personId of an adjacent blank-actionType row like 'X STEAL (1 STL)'.
+        Marker rows share their parent event's EVENTNUM."""
+        parent_num = self.events.iloc[idx]["EVENTNUM"]
+        for j in (idx + 1, idx - 1):
+            if 0 <= j < len(self.events):
+                row = self.events.iloc[j]
+                if row["ACTION_TYPE"] == "" and row["EVENTNUM"] == parent_num \
+                        and marker in str(row["DESCRIPTION"]).upper():
+                    pid = int(row["PERSON_ID"])
+                    if pid > 0:
+                        return pid
+        return None
+
+    def _parse_assister(self, row, team: int, shooter: int):
+        m = _AST_RE.search(str(row["DESCRIPTION"]))
+        if not m:
+            return None
+        pid = self.roster.resolve_family(team, m.group(1), prefer_not_in={shooter})
+        return pid if pid and pid != shooter else None
+
+    def _next_ft_shooter(self, start_idx: int, offense_team: int):
+        """The fouled player is identified by who shoots the ensuing FTs
+        (V3 foul descriptions name the referee, not the fouled player)."""
+        for j in range(start_idx, min(start_idx + 6, len(self.events))):
+            row = self.events.iloc[j]
+            at = row["ACTION_TYPE"]
+            if at == ACT_FT:
+                pid = int(row["PERSON_ID"])
+                if int(row["TEAM_ID"]) == offense_team and pid > 0:
+                    return pid
+                return None
+            if at not in ("", ACT_SUB, ACT_TIMEOUT):
+                return None
+        return None
 
     # ------------------------------------------------------------ row emission
     def emit_chance(self, *, elapsed, period, offense_team, ball_ender, action,
@@ -212,15 +346,15 @@ class GameTransformer:
                     def_fouls_before=0, assist_id=None, steal_id=None,
                     block_id=None):
         defense_team = self.other(offense_team)
-        off_lineup = self.rot.lineup_at(offense_team, elapsed, must_include=ball_ender)
-        def_lineup = self.rot.lineup_at(defense_team, elapsed)
+        off_lineup = self.tracker.lineup_at(offense_team, elapsed, must_include=ball_ender)
+        def_lineup = self.tracker.lineup_at(defense_team, elapsed)
         if off_lineup is None or def_lineup is None:
             self.skipped += 1
             self.chance_start = elapsed
             return
         slot = off_lineup.index(ball_ender) if ball_ender in off_lineup else -1
-        off_stints = [self.rot.stint_features(offense_team, p, elapsed) for p in off_lineup]
-        def_stints = [self.rot.stint_features(defense_team, p, elapsed) for p in def_lineup]
+        off_stints = [self.tracker.stint_features(offense_team, p, elapsed) for p in off_lineup]
+        def_stints = [self.tracker.stint_features(defense_team, p, elapsed) for p in def_lineup]
         duration = float(np.clip(elapsed - self.chance_start, 0.5, 35.0))
         self.chance_start = elapsed
 
@@ -235,7 +369,7 @@ class GameTransformer:
             "ball_ender_slot": slot,
             "action": action, "shot_result": shot_result,
             "points": int(points), "n_ft": int(n_ft), "ft_made": int(ft_made),
-            "oreb": oreb if oreb is not None else -1,        # 1/0, -1 = n/a
+            "oreb": oreb if oreb is not None else -1,
             "rebounder": rebounder if rebounder is not None else -1,
             "assist_id": assist_id if assist_id is not None else -1,
             "steal_id": steal_id if steal_id is not None else -1,
@@ -250,17 +384,16 @@ class GameTransformer:
         })
 
     def emit_sub_decisions(self, elapsed, period, force: bool = False):
-        """At a deadball, record (player, exited-within-10s?) for everyone on floor."""
         if not force and random.random() > MADE_SHOT_DEADBALL_SAMPLE:
             return
         margin = abs(self.scores[self.home_team] - self.scores[self.away_team])
         sec_rem = self.period_seconds_remaining(period, elapsed)
-        for team in self.rot.team_ids:
-            starters = self.rot.starters(team)
-            for pid in self.rot.on_floor(team, elapsed - 0.5):
-                stint, cum = self.rot.stint_features(team, pid, elapsed)
+        for team in self.roster.team_ids:
+            starters = self.roster.starters[team]
+            for pid in self.tracker.on_floor_at(team, elapsed - 0.5):
+                stint, cum = self.tracker.stint_features(team, pid, elapsed)
                 exited = any(elapsed - 1.0 < hi <= elapsed + 10.0
-                             for _, hi in self.rot.intervals[(team, pid)])
+                             for _, hi in self.tracker.intervals[(team, pid)])
                 self.sub_rows.append({
                     "game_id": self.game_id, "season": self.season,
                     "player_id": pid, "team_id": team,
@@ -278,43 +411,43 @@ class GameTransformer:
         i = 0
         while i < len(ev):
             row = ev.iloc[i]
-            etype = row["EVENTMSGTYPE"]
+            at = row["ACTION_TYPE"]
+            sub_type = str(row["SUB_TYPE"])
             elapsed = float(row["ELAPSED"])
             period = int(row["PERIOD"])
+            team = int(row["TEAM_ID"])
+            pid = int(row["PERSON_ID"])
 
-            if etype == EVT_MADE_SHOT and is_player_id(row["PLAYER1_ID"]):
-                shooter = int(row["PLAYER1_ID"])
-                team = int(row["PLAYER1_TEAM_ID"])
-                three = is_3pt(row)
+            if at == ACT_MADE and pid > 0:
+                three = int(row["SHOT_VALUE"]) == 3
                 margin_before = self.margin_for(team)
                 def_fouls = self.team_fouls_period[(self.other(team), period)]
                 pts = 3 if three else 2
                 self.scores[team] += pts
+                assister = self._parse_assister(row, team, pid)
 
-                # and-one: a shooting/personal foul on the shooter at ~the same instant
+                # and-one: defensive foul at ~the same instant whose FTs go
+                # to the shooter
                 shot_result, n_ft, ft_made = "make", 0, 0
                 j = i + 1
                 while j < len(ev) and abs(float(ev.iloc[j]["ELAPSED"]) - elapsed) < 1.5:
                     nrow = ev.iloc[j]
-                    if nrow["EVENTMSGTYPE"] == EVT_FOUL \
-                            and nrow["EVENTMSGACTIONTYPE"] not in FOUL_TECHNICAL \
-                            and is_player_id(nrow["PLAYER2_ID"]) \
-                            and int(nrow["PLAYER2_ID"]) == shooter:
-                        self.team_fouls_period[(self.other(team), period)] += 1
-                        if is_player_id(nrow["PLAYER1_ID"]):
-                            self.player_fouls[int(nrow["PLAYER1_ID"])] += 1
-                        n_ft, ft_made, _, j = self._ft_run(j + 1, shooter)
-                        shot_result = "andone"
+                    nsub = str(nrow["SUB_TYPE"])
+                    if nrow["ACTION_TYPE"] == ACT_FOUL \
+                            and "Offensive" not in nsub and "Technical" not in nsub \
+                            and int(nrow["TEAM_ID"]) == self.other(team):
+                        if self._next_ft_shooter(j + 1, team) == pid:
+                            self.team_fouls_period[(self.other(team), period)] += 1
+                            if int(nrow["PERSON_ID"]) > 0:
+                                self.player_fouls[int(nrow["PERSON_ID"])] += 1
+                            n_ft, ft_made, _, j = self._ft_run(j + 1, pid)
+                            shot_result = "andone"
                         break
                     j += 1
 
-                assister = (int(row["PLAYER2_ID"])
-                            if is_player_id(row["PLAYER2_ID"])
-                            and is_team_id(row["PLAYER2_TEAM_ID"])
-                            and int(row["PLAYER2_TEAM_ID"]) == team else None)
                 self.emit_chance(
                     elapsed=elapsed, period=period, offense_team=team,
-                    ball_ender=shooter,
+                    ball_ender=pid,
                     action="3pt_attempt" if three else "2pt_attempt",
                     shot_result=shot_result, points=pts + ft_made,
                     n_ft=n_ft, ft_made=ft_made, assist_id=assister,
@@ -323,19 +456,14 @@ class GameTransformer:
                 i = j if shot_result == "andone" else i + 1
                 continue
 
-            if etype == EVT_MISSED_SHOT and is_player_id(row["PLAYER1_ID"]):
-                shooter = int(row["PLAYER1_ID"])
-                team = int(row["PLAYER1_TEAM_ID"])
-                three = is_3pt(row)
+            if at == ACT_MISSED and pid > 0:
+                three = int(row["SHOT_VALUE"]) == 3
+                blocker = self._adjacent_marker(i, "BLOCK")
                 reb_team, reb_player = self._find_rebound(i + 1)
                 oreb = int(reb_team == team) if reb_team is not None else None
-                blocker = (int(row["PLAYER3_ID"])
-                           if is_player_id(row["PLAYER3_ID"])
-                           and is_team_id(row["PLAYER3_TEAM_ID"])
-                           and int(row["PLAYER3_TEAM_ID"]) != team else None)
                 self.emit_chance(
                     elapsed=elapsed, period=period, offense_team=team,
-                    ball_ender=shooter,
+                    ball_ender=pid,
                     action="3pt_attempt" if three else "2pt_attempt",
                     shot_result="miss", oreb=oreb, rebounder=reb_player,
                     block_id=blocker,
@@ -344,53 +472,44 @@ class GameTransformer:
                 i += 1
                 continue
 
-            if etype == EVT_TURNOVER:
-                if not is_team_id(row["PLAYER1_TEAM_ID"]):
-                    i += 1
-                    continue
-                team = int(row["PLAYER1_TEAM_ID"])
-                pid = int(row["PLAYER1_ID"]) if is_player_id(row["PLAYER1_ID"]) else None
-                desc = event_desc(row)
-                action = "off_foul" if ("OFF.FOUL" in desc or "OFFENSIVE FOUL" in desc
-                                        or "CHARGE" in desc) else "turnover"
-                if action == "off_foul" and pid is not None:
-                    self.player_fouls[pid] += 1
-                stealer = (int(row["PLAYER2_ID"])
-                           if is_player_id(row["PLAYER2_ID"])
-                           and is_team_id(row["PLAYER2_TEAM_ID"])
-                           and int(row["PLAYER2_TEAM_ID"]) != team else None)
+            if at == ACT_TURNOVER and team > 0:
+                action = ("off_foul" if "offensive foul" in sub_type.lower()
+                          else "turnover")
+                ball_ender = pid if pid > 0 else None
+                if action == "off_foul" and ball_ender is not None:
+                    self.player_fouls[ball_ender] += 1
+                stealer = self._adjacent_marker(i, "STEAL")
                 self.emit_chance(
                     elapsed=elapsed, period=period, offense_team=team,
-                    ball_ender=pid, action=action, steal_id=stealer,
+                    ball_ender=ball_ender, action=action,
+                    steal_id=stealer if action == "turnover" else None,
                     margin_before=self.margin_for(team),
                     def_fouls_before=self.team_fouls_period[(self.other(team), period)])
                 i += 1
                 continue
 
-            if etype == EVT_FOUL:
-                atype = row["EVENTMSGACTIONTYPE"]
-                fouler_team = int(row["PLAYER1_TEAM_ID"]) if is_team_id(row["PLAYER1_TEAM_ID"]) else None
-                if is_player_id(row["PLAYER1_ID"]):
-                    self.player_fouls[int(row["PLAYER1_ID"])] += 1
-                if atype in FOUL_TECHNICAL or fouler_team is None:
+            if at == ACT_FOUL and team > 0:
+                if pid > 0:
+                    self.player_fouls[pid] += 1
+                if "Technical" in sub_type:
                     i += 1
                     continue
-                if atype in FOUL_OFFENSIVE:
-                    # handled by the paired turnover event
-                    self.team_fouls_period[(fouler_team, period)] += 1
+                if "Offensive" in sub_type:
+                    # the paired Turnover row carries the chance
                     i += 1
                     continue
 
-                self.team_fouls_period[(fouler_team, period)] += 1
-                offense_team = self.other(fouler_team)
-                fouled = int(row["PLAYER2_ID"]) if is_player_id(row["PLAYER2_ID"]) else None
+                self.team_fouls_period[(team, period)] += 1
+                offense_team = self.other(team)
+                fouled = self._next_ft_shooter(i + 1, offense_team)
 
-                if atype in FOUL_SHOOTING and fouled is not None:
+                if "Shooting" in sub_type and fouled is not None:
                     n_ft, ft_made, last_missed, j = self._ft_run(i + 1, fouled)
-                    oreb, rebounder = (None, None)
+                    oreb, rebounder = None, None
                     if last_missed:
                         reb_team, reb_player = self._find_rebound(j)
-                        oreb = int(reb_team == offense_team) if reb_team is not None else None
+                        oreb = (int(reb_team == offense_team)
+                                if reb_team is not None else None)
                         rebounder = reb_player
                     self.emit_chance(
                         elapsed=elapsed, period=period, offense_team=offense_team,
@@ -399,41 +518,49 @@ class GameTransformer:
                         shot_result="shooting_foul", points=ft_made,
                         n_ft=n_ft, ft_made=ft_made, oreb=oreb, rebounder=rebounder,
                         margin_before=self.margin_for(offense_team),
-                        def_fouls_before=self.team_fouls_period[(fouler_team, period)] - 1)
+                        def_fouls_before=self.team_fouls_period[(team, period)] - 1)
                     self.emit_sub_decisions(elapsed, period, force=True)
                     i = max(j, i + 1)
                     continue
 
-                # non-shooting defensive foul: offense keeps the ball (or shoots
-                # bonus FTs); ball-ender = the FOULED player, never the defender
+                # non-shooting defensive foul: if it produced (bonus) FTs the
+                # shooter is the fouled player; otherwise the drawn foul is
+                # kept at lineup level (ball_ender=None -> slot -1)
+                n_ft, ft_made, last_missed, j = 0, 0, False, i + 1
+                oreb, rebounder = None, None
                 if fouled is not None:
                     n_ft, ft_made, last_missed, j = self._ft_run(i + 1, fouled)
-                    self.emit_chance(
-                        elapsed=elapsed, period=period, offense_team=offense_team,
-                        ball_ender=fouled, action="drawn_foul",
-                        points=ft_made, n_ft=n_ft, ft_made=ft_made,
-                        margin_before=self.margin_for(offense_team),
-                        def_fouls_before=self.team_fouls_period[(fouler_team, period)] - 1)
-                    self.emit_sub_decisions(elapsed, period, force=True)
-                    i = max(j, i + 1)
-                    continue
+                    if last_missed:
+                        reb_team, reb_player = self._find_rebound(j)
+                        oreb = (int(reb_team == offense_team)
+                                if reb_team is not None else None)
+                        rebounder = reb_player
+                self.emit_chance(
+                    elapsed=elapsed, period=period, offense_team=offense_team,
+                    ball_ender=fouled, action="drawn_foul",
+                    points=ft_made, n_ft=n_ft, ft_made=ft_made,
+                    oreb=oreb, rebounder=rebounder,
+                    margin_before=self.margin_for(offense_team),
+                    def_fouls_before=self.team_fouls_period[(team, period)] - 1)
+                self.emit_sub_decisions(elapsed, period, force=True)
+                i = max(j, i + 1)
+                continue
+
+            if at == ACT_FT:
+                # stray FTs not consumed by a foul handler (e.g. technicals)
+                if i not in self.consumed_ft and team > 0 \
+                        and not str(row["DESCRIPTION"]).upper().startswith("MISS"):
+                    self.scores[team] += 1
                 i += 1
                 continue
 
-            if etype == EVT_FREE_THROW:
-                # FTs not consumed by a foul handler (e.g. technicals): score only
-                if "MISS" not in event_desc(row) and is_team_id(row["PLAYER1_TEAM_ID"]):
-                    self.scores[int(row["PLAYER1_TEAM_ID"])] += 1
-                i += 1
-                continue
-
-            if etype == EVT_TIMEOUT:
+            if at == ACT_TIMEOUT:
                 self.emit_sub_decisions(elapsed, period, force=True)
                 i += 1
                 continue
 
-            if etype == EVT_PERIOD_END:
-                self.chance_start = elapsed
+            if at == ACT_PERIOD and sub_type == "end":
+                self.chance_start = period_start_elapsed(period + 1)
                 self.emit_sub_decisions(elapsed, period, force=True)
                 i += 1
                 continue
@@ -448,12 +575,12 @@ class GameTransformer:
                 "home_score": self.scores[self.home_team],
                 "away_score": self.scores[self.away_team],
                 "n_chances": len(self.chances), "n_skipped": self.skipped,
+                "fill_periods": self.tracker.fill_periods,
             },
         }
 
 
 def transform_all(seasons=None) -> dict:
-    """Run the transformer over every collected game; write tables; return paths."""
     seasons = seasons or config.SEASONS
     config.TABLES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -461,20 +588,21 @@ def transform_all(seasons=None) -> dict:
     for season in seasons:
         tag = season.replace("-", "_")
         events_path = config.EVENTS_DIR / f"events_{tag}.parquet"
-        rot_path = config.ROTATIONS_DIR / f"rotations_{tag}.parquet"
-        if not events_path.exists() or not rot_path.exists():
+        players_path = config.PLAYERS_DIR / f"players_{tag}.parquet"
+        if not events_path.exists() or not players_path.exists():
             print(f"[{season}] no collected data, skipping")
             continue
         events = pd.read_parquet(events_path)
-        rotations = pd.read_parquet(rot_path)
-        game_ids = sorted(set(events["GAME_ID"]) & set(rotations["GAME_ID"]))
+        players = pd.read_parquet(players_path)
+        game_ids = sorted(set(events["GAME_ID"]) & set(players["GAME_ID"]))
         print(f"[{season}] transforming {len(game_ids)} games")
 
-        rot_by_game = dict(tuple(rotations.groupby("GAME_ID")))
         ev_by_game = dict(tuple(events.groupby("GAME_ID")))
+        pl_by_game = dict(tuple(players.groupby("GAME_ID")))
         for n, gid in enumerate(game_ids, 1):
             try:
-                result = GameTransformer(gid, season, ev_by_game[gid], rot_by_game[gid]).run()
+                result = GameTransformer(gid, season, ev_by_game[gid],
+                                         pl_by_game[gid]).run()
             except Exception as e:
                 print(f"  {gid}: transform failed ({str(e)[:80]})")
                 continue
@@ -494,9 +622,11 @@ def transform_all(seasons=None) -> dict:
 
     if len(games):
         cpg = len(chances) / len(games)
-        skip_rate = games["n_skipped"].sum() / max(games["n_skipped"].sum() + len(chances), 1)
+        n_skip = games["n_skipped"].sum()
+        skip_rate = n_skip / max(n_skip + len(chances), 1)
         print(f"\n{len(chances):,} chances from {len(games):,} games "
-              f"({cpg:.0f} per game, {skip_rate:.1%} skipped on lineup issues)")
+              f"({cpg:.0f} per game, {skip_rate:.1%} skipped on lineup issues, "
+              f"{games['fill_periods'].mean():.1f} carry-over periods/game)")
     return {"chances": config.CHANCES_FILE, "games": config.GAMES_FILE}
 
 
